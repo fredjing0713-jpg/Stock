@@ -77,7 +77,15 @@ class Clock:
 
 
 def make_cfg(dry_run: bool = False, risk: RiskConfig | None = None, **trading: object) -> AppConfig:
-    opts: dict[str, object] = {"dry_run": dry_run, "min_order_value_usd": 1.0, "fill_timeout_seconds": 1}
+    # Most scenarios were written for a 1.9x cap without Reg T floor / 二次调仓; pin those.
+    opts: dict[str, object] = {
+        "dry_run": dry_run,
+        "min_order_value_usd": 1.0,
+        "fill_timeout_seconds": 1,
+        "regt_overnight_check": False,
+        "max_gross_leverage": 1.9,
+        "rebalance_on_signal": False,
+    }
     opts.update(trading)
     return AppConfig(
         discord=DiscordConfig(signal_channel_id=1, log_channel_id=2, owner_ids=[3]),
@@ -1122,3 +1130,148 @@ async def test_paused_signal_keeps_protective_deleverage_sell(make):
     env.clock.set(ny(2026, 10, 2, 9, 51, 30))
     await env.send(signal(["加仓 D | 仓位：10.0% → 20.0% | 成交价：50"], None, "2026-10-02 09:51:20"))
     assert [o.tag for o in b.working("D", MKT)] == ["copybot:dlv"]
+
+
+# --------------------------------------------------------------------------- liquidity-first, 二次调仓, confirmations
+
+
+def live_cfg(**trading: object) -> AppConfig:
+    """The shipped defaults (liquidity first, Reg T check, 二次调仓 on)."""
+    opts: dict[str, object] = {"dry_run": False, "min_order_value_usd": 1.0, "fill_timeout_seconds": 1}
+    opts.update(trading)
+    return AppConfig(
+        discord=DiscordConfig(signal_channel_id=1, log_channel_id=2, owner_ids=[3]),
+        trading=TradingConfig(**opts),
+    )
+
+
+THREE = ["RKLB | 仓位：33.33% | 成本：50 | 盈亏：0.0%", "MU | 仓位：33.33% | 成本：100 | 盈亏：0.0%"]
+ROTATE = signal(
+    ["清仓 BE | 仓位：33.33% → 0.0% | 成交价：无", "建仓 NVDA | 仓位：0.0% → 33.33% | 成交价：200"],
+    [*THREE, "NVDA | 仓位：33.33% | 成本：200 | 盈亏：0.0%"],
+    "2026-10-02 09:50:59",
+)
+
+
+def three_stock_account(b: FakeBroker) -> float:
+    """RKLB / MU / BE equal thirds at the G the bot would have used. Returns that G."""
+    b.rates.update({
+        "RKLB": MarginRate(0.45, 0.45), "MU": MarginRate(0.40, 0.40),
+        "BE": MarginRate(0.70, 0.70), "NVDA": MarginRate(0.30, 0.30),
+    })
+    for sym, px in (("RKLB", 50.0), ("MU", 100.0), ("BE", 150.0), ("NVDA", 200.0)):
+        b.set_quote(sym, px - 0.05, px, px)
+    g_before = 75_000 / ((0.45 + 0.40 + 0.70) / 3)  # 25% reserve binds (high-margin names)
+    third = g_before / 3
+    b.set_position("RKLB", int(third / 50), 50.0)
+    b.set_position("MU", int(third / 100), 100.0)
+    b.set_position("BE", int(third / 150), 150.0)
+    b.cash = 100_000 - (int(third / 50) * 50 + int(third / 100) * 100 + int(third / 150) * 150)
+    return g_before
+
+
+async def test_example_with_defaults_is_limited_by_regt_not_a_fixed_cap(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    example_account(env.broker)
+    await env.send(EXAMPLE)
+    wdc = [r for r in env.broker.placed if r.symbol == "WDC"][0]
+    assert wdc.qty == math.floor(98_000 / 0.5 / 422.8)  # Reg T overnight 50% → 1.96x
+    assert "Reg T 隔夜保证金" in env.joined()
+
+
+async def test_rotation_into_lower_margin_stock_tops_up_the_others(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    b = env.broker
+    three_stock_account(b)
+    rklb0, mu0 = b.qty("RKLB"), b.qty("MU")
+
+    await env.send(ROTATE)
+
+    sides = [(r.symbol, r.side) for r in b.placed]
+    assert sides[0] == ("BE", SELL)  # sells first
+    assert {("NVDA", BUY), ("RKLB", BUY), ("MU", BUY)} <= set(sides)
+    assert b.qty("BE") == 0
+    # Equal thirds again at the new, larger G (each within a share of the others).
+    values = [b.qty("RKLB") * 50, b.qty("MU") * 100, b.qty("NVDA") * 200]
+    assert max(values) - min(values) <= 200
+    assert b.qty("RKLB") > rklb0 and b.qty("MU") > mu0
+    assert "二次调仓" in env.joined()
+    for r in b.placed:
+        assert isinstance(r.qty, int)
+
+
+async def test_rotation_into_higher_margin_stock_trims_the_others(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    b = env.broker
+    b.rates.update({"RKLB": MarginRate(0.45, 0.45), "MU": MarginRate(0.40, 0.40),
+                    "NVDA": MarginRate(0.30, 0.30), "BE": MarginRate(0.70, 0.70)})
+    for sym, px in (("RKLB", 50.0), ("MU", 100.0), ("BE", 150.0), ("NVDA", 200.0)):
+        b.set_quote(sym, px - 0.05, px, px)
+    third = 75_000 / ((0.45 + 0.40 + 0.30) / 3) / 3
+    b.set_position("RKLB", int(third / 50), 50.0)
+    b.set_position("MU", int(third / 100), 100.0)
+    b.set_position("NVDA", int(third / 200), 200.0)
+    b.cash = 100_000 - (int(third / 50) * 50 + int(third / 100) * 100 + int(third / 200) * 200)
+    rklb0, mu0 = b.qty("RKLB"), b.qty("MU")
+
+    await env.send(signal(
+        ["清仓 NVDA | 仓位：33.33% → 0.0% | 成交价：无", "建仓 BE | 仓位：0.0% → 33.33% | 成交价：150"],
+        [*THREE, "BE | 仓位：33.33% | 成本：150 | 盈亏：0.0%"],
+        "2026-10-02 09:50:59",
+    ))
+
+    assert b.qty("RKLB") < rklb0 and b.qty("MU") < mu0  # trimmed to make room
+    sells = [r.symbol for r in b.placed if r.side == SELL]
+    buys = [r.symbol for r in b.placed if r.side == BUY]
+    assert set(sells) == {"NVDA", "RKLB", "MU"} and buys == ["BE"]
+    account = await b.account()
+    assert account.el_ratio >= 0.25 - 0.01  # the liquidity reserve holds
+
+
+async def test_repeated_broadcast_is_a_confirmation_not_a_second_buy(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    example_account(env.broker)
+    await env.send(EXAMPLE)
+    n = len(env.broker.placed)
+
+    env.clock.advance(minutes=3)  # he announces the same change again when it fills
+    await env.send(EXAMPLE.replace("成交价：422.6", "成交价：422.9").replace("09:50:59", "09:53:30"))
+
+    assert len(env.broker.placed) == n
+    assert "重复播报" in env.texts()[-1]
+
+
+async def test_confirmation_after_stop_out_does_not_buy_back(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    b = env.broker
+    example_account(b)
+    await env.send(EXAMPLE)
+    await env.engine.sync_stops()
+    await b.trigger_stop("WDC")
+    assert "WDC" in env.store.stopped()
+
+    env.clock.advance(minutes=3)
+    await env.send(EXAMPLE.replace("09:50:59", "09:53:30"))  # his fill confirmation, after our stop
+
+    assert "WDC" in env.store.stopped()
+    assert b.qty("WDC") == 0
+
+
+async def test_premarket_rotation_trades_only_his_changes_and_rebalances_at_open(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3), cash=0.0, cfg=live_cfg())
+    b = env.broker
+    three_stock_account(b)
+    b.auto_fill_limits = True
+
+    await env.send(ROTATE.replace("09:50:59", "08:00:00"))
+
+    pre = [(r.symbol, r.order_type) for r in b.placed]
+    assert ("BE", LMT) in pre and ("NVDA", LMT) in pre
+    assert not any(s in ("RKLB", "MU") for s, _ in pre)  # 二次调仓 waits for the open
+    pending = {it.symbol: it.kind for it, _ in env.store.list_pending()}
+    assert pending["RKLB"] == "rebalance" and pending["MU"] == "rebalance"
+
+    env.clock.set(ny(2026, 10, 2, 9, 30, 6))
+    await env.engine.run_due_pending()
+    at_open = [(r.symbol, r.side, r.order_type) for r in b.placed[len(pre):]]
+    assert ("RKLB", BUY, MKT) in at_open and ("MU", BUY, MKT) in at_open

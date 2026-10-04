@@ -26,6 +26,9 @@ def test_example_config_loads_with_safe_defaults(cfg_path):
     assert cfg.trading.reserve_ratio == 0.25
     assert cfg.trading.extended_hours_buy_fraction == 0.5
     assert cfg.trading.extended_hours_sell_fraction == 1.0
+    assert cfg.trading.regt_overnight_check is True
+    assert cfg.trading.max_gross_leverage == 4.0
+    assert cfg.trading.rebalance_on_signal is True and cfg.trading.rebalance_band_pct == 5.0
 
 
 @pytest.mark.parametrize(("raw", "expected"), [("true", True), ("1", True), ("YES", True), ("false", False), ("0", False)])

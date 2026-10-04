@@ -715,7 +715,10 @@ async def test_run_forever_survives_unexpected_errors(broker_and_ib, monkeypatch
 
     monkeypatch.setattr(b, "connect", bad_connect)
     task = asyncio.create_task(b.run_forever())
-    await asyncio.sleep(0.08)
+    for _ in range(200):  # wait (up to 2 s) for at least two attempts; robust under load
+        if calls["n"] >= 2:
+            break
+        await asyncio.sleep(0.01)
     assert not task.done()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

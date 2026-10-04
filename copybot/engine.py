@@ -57,6 +57,7 @@ from .models import (
 from .notifier import Notifier
 from .parser import parse_signal, suspicious_lines
 from .sizing import (
+    NOTE_REBALANCE,
     compute_gross_target,
     conservative_account,
     deleverage_orders,
@@ -66,6 +67,7 @@ from .sizing import (
     extended_limit_price,
     intents_for_sync,
     intents_from_signal,
+    rebalance_intents,
     resolve_intents,
     scale_buys_for_liquidity,
     split_extended,
@@ -106,7 +108,8 @@ KV_PORTFOLIO = "provider_portfolio"
 KV_LAST_MISMATCH = "last_mismatch"
 KV_LAST_DELEVERAGE_TS = "last_deleverage_ts"
 KV_LAST_LIQUIDITY_WARN_TS = "last_liquidity_warn_ts"
-KV_CANCEL_LEFTOVERS = "cancel_leftovers"  # symbols whose extended-hours orders still must be cancelled
+KV_CANCEL_LEFTOVERS = "cancel_leftovers"
+KV_LAST_CHANGES = "last_changes"  # symbol → [from, to] of his latest change line  # symbols whose extended-hours orders still must be cancelled
 
 SESSION_CN = {Session.PRE: "盘前", Session.REGULAR: "盘中", Session.AFTER: "盘后", Session.CLOSED: "休市"}
 BINDING_CN = {"reserve": "剩余流动性保留", "init_margin": "初始保证金", "leverage_cap": "杠杆上限"}
@@ -209,6 +212,8 @@ def _result_line(o: PlannedOrder, info: OrderInfo | None, error: str = "", label
         head = f"{label}限价{_side_cn(o.side)} {o.symbol} {o.qty}股 @{_px(info.limit_price)}"
     else:
         head = f"{_side_cn(o.side)} {o.symbol} {o.qty}股"
+    if o.note == NOTE_REBALANCE:
+        head += "（二次调仓）"
     if info is None:
         return f"❌ {head} 下单失败：{error}", "error"
     filled = info.filled_qty
@@ -341,6 +346,10 @@ class Engine:
     def _provider_weights(self) -> dict[str, float]:
         weights = (self._portfolio() or {}).get("weights") or {}
         return {str(s): float(w) for s, w in weights.items()}
+
+    @property
+    def _rebalance_band(self) -> float:
+        return self._t.rebalance_band_pct / 100
 
     def _poke_stops(self) -> None:
         self._stop_event.set()
@@ -638,7 +647,12 @@ class Engine:
 
         # A new signal for a stopped-out symbol ends its stop-out mark — also when it is
         # not traded (paused / stale), so that the advised !sync can follow him back in.
-        reentered = self._clear_stopped(sig, sig_ts)
+        # He announces a change when he places the order and again when it fills: the
+        # same change (same symbol, same from→to) again is a confirmation — it fills a
+        # meaningful gap only and never counts as a new add after a stop-out.
+        confirms = self._confirmations(sig)
+        self._remember_changes(sig)
+        reentered = self._clear_stopped(sig, sig_ts, skip=confirms)
 
         # 4. paused
         if self.is_paused:
@@ -657,9 +671,20 @@ class Engine:
             return
 
         # 6. intents (a stopped-out symbol with an add / open signal is bought back)
-        intents = intents_from_signal(sig, self._ignore)
+        intents = self._signal_intents(sig, confirms)
         for sym in reentered:
             rep.add(f"🔁 {sym} 止损后重新跟入")
+        if confirms:
+            rep.add(
+                f"🔁 重复播报（他的成交确认）：{'、'.join(sorted(confirms))}，只在与目标相差超过 "
+                f"{self._t.rebalance_band_pct:g}% 时补单"
+            )
+        rebal = sorted(i.symbol for i in intents if i.kind == "rebalance")
+        if rebal:
+            rep.add(
+                f"📊 二次调仓：按新的 100% 仓位把 {'、'.join(rebal)} 调到他的比例"
+                f"（相差不到 {self._t.rebalance_band_pct:g}% 不动）"
+            )
 
         # 7. execute by session
         status = "no_action"
@@ -691,7 +716,42 @@ class Engine:
         if sem is not None:
             self.store.record_signal(sem, message_id, ts, status, summary)
 
-    def _clear_stopped(self, sig: Signal, sig_ts: datetime | None) -> list[str]:
+    def _confirmations(self, sig: Signal) -> set[str]:
+        """Symbols whose change line repeats his latest change for that symbol."""
+        last = self.store.get(KV_LAST_CHANGES) or {}
+        if not isinstance(last, dict):
+            return set()
+        return {
+            ch.symbol
+            for ch in sig.changes
+            if last.get(ch.symbol) == [round(ch.from_weight, 6), round(ch.to_weight, 6)]
+        }
+
+    def _remember_changes(self, sig: Signal) -> None:
+        if not sig.changes:
+            return
+        last = self.store.get(KV_LAST_CHANGES) or {}
+        if not isinstance(last, dict):
+            last = {}
+        for ch in sig.changes:
+            last[ch.symbol] = [round(ch.from_weight, 6), round(ch.to_weight, 6)]
+        self.store.set(KV_LAST_CHANGES, last)
+
+    def _signal_intents(self, sig: Signal, confirms: set[str]) -> list[Intent]:
+        """His change lines, plus (after a real 调仓) his other holdings re-sized to the new G."""
+        band = self._rebalance_band
+        stopped = set(self.store.stopped())  # marks still set: no new add from him since
+        intents = [
+            replace(i, kind="confirm", band=band) if i.symbol in confirms else i
+            for i in intents_from_signal(sig, self._ignore)
+            if not (i.symbol in stopped and i.direction == "buy")
+        ]
+        if self._t.rebalance_on_signal and any(i.kind == "signal" for i in intents):
+            exclude = {i.symbol for i in intents} | stopped | self._ignore
+            intents += rebalance_intents(self._provider_weights(), exclude, band, sig.fingerprint)
+        return intents
+
+    def _clear_stopped(self, sig: Signal, sig_ts: datetime | None, skip: set[str] = frozenset()) -> list[str]:
         """Clear stop-out marks of the signal's symbols; returns those with an increase.
 
         Only a signal issued after the stop-out counts (an older one, delivered late,
@@ -701,7 +761,7 @@ class Engine:
         reentered: list[str] = []
         for ch in sig.changes:
             mark = stopped.get(ch.symbol)
-            if mark is None or ch.symbol in self._ignore:
+            if mark is None or ch.symbol in self._ignore or ch.symbol in skip:
                 continue
             if sig_ts is not None and sig_ts <= mark["stopped_at"]:
                 continue
@@ -828,20 +888,17 @@ class Engine:
         return [
             f"💰 净资产 {_usd(a.net_liquidation)} | 剩余流动性 {_usd(a.excess_liquidity)}（{a.el_ratio:.1%}）"
             f" | 杠杆 {a.leverage:.2f}x",
-            f"📐 100%仓位 ≈ {_usd(g.gross)}（受限于{BINDING_CN.get(g.binding, g.binding)}）",
+            f"📐 100%仓位 ≈ {_usd(g.gross)}（受限于{self._binding_text(g.binding)}）",
         ]
 
+    def _binding_text(self, binding: str) -> str:
+        if binding == "init_margin" and self._t.regt_overnight_check:
+            return "Reg T 隔夜保证金（约 2 倍）"
+        return BINDING_CN.get(binding, binding)
+
     def _resolve(self, intents: Sequence[Intent], ctx: _Context) -> tuple[list[PlannedOrder], list[SkipNote]]:
-        """resolve_intents with the !sync band applied only to !sync intents. SELLs first."""
-        normal = [i for i in intents if i.signal_key != SYNC_KEY]
-        synced = [i for i in intents if i.signal_key == SYNC_KEY]
-        orders: list[PlannedOrder] = []
-        skips: list[SkipNote] = []
-        for group, band in ((normal, 0.0), (synced, SYNC_BAND)):
-            if group:
-                o, s = resolve_intents(group, ctx.positions, ctx.quotes, ctx.gross.gross, self._t, sync_band=band)
-                orders += o
-                skips += s
+        """resolve_intents (each intent carries its own tolerance band). SELLs first."""
+        orders, skips = resolve_intents(intents, ctx.positions, ctx.quotes, ctx.gross.gross, self._t)
         sells = [o for o in orders if o.side == Side.SELL]
         buys = [o for o in orders if o.side == Side.BUY]
         return sells + buys, skips
@@ -1053,8 +1110,11 @@ class Engine:
         ctx = await self._gather_context(symbols, intents)
         rep.lines.extend(self._context_lines(ctx))
         orders, skips = self._resolve(active, ctx)
-        ext = split_extended(orders, self._t.extended_hours_buy_fraction, self._t.extended_hours_sell_fraction)
         by_symbol = {i.symbol: i for i in active}
+        # Only his actual change lines trade outside regular hours; confirmations,
+        # 二次调仓 and !sync wait for the open (thin pre-market books, no urgency).
+        now_orders = [o for o in orders if by_symbol[o.symbol].kind == "signal"]
+        ext = split_extended(now_orders, self._t.extended_hours_buy_fraction, self._t.extended_hours_sell_fraction)
         tag = f"{EXT_TAG}:{key8}"
         buffer = self._t.ext_limit_buffer_pct
 
@@ -1345,6 +1405,7 @@ class Engine:
         out: list[Intent] = []
         notes: list[SkipNote] = []
         for it in intents_for_sync(weights, positions, self._ignore):
+            it = replace(it, kind="sync", band=SYNC_BAND)
             if it.symbol not in stopped:
                 out.append(it)
                 continue

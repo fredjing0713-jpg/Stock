@@ -51,14 +51,23 @@ class TradingConfig(_Strict):
     dry_run: bool = True  # True = 只算不下单 (先用 paper 账户 / dry-run 验证!)
 
     # ---- 融资 / 仓位基数 (G) ----
-    reserve_ratio: float = 0.25  # 目标剩余流动性 = 净资产 × 25%
-    max_gross_leverage: float = 1.9  # 总持仓市值 / 净资产 上限 (Reg T 隔夜上限约 2.0)
+    reserve_ratio: float = 0.25  # 目标剩余流动性 = 净资产 × 25% (主规则)
+    # Reg T 账户: IBKR 收盘时按 50% 初始保证金检查隔夜持仓, 不够会强制平仓。
+    # True = 按 50% 计算隔夜上限 (约 2 倍)。确认是 Portfolio Margin 账户才改成 False。
+    regt_overnight_check: bool = True
+    max_gross_leverage: float = 4.0  # 只是防数据异常的保险上限 (总持仓市值 / 净资产)
     init_margin_buffer: float = 0.02  # 开仓时可用资金至少保留 净资产 × 2%
     default_init_margin: float = 0.50  # whatIf 拿不到时的默认初始保证金比例
     default_maint_margin: float = 0.30  # whatIf 拿不到时的默认维持保证金比例
     min_margin_rate: float = 0.10  # whatIf 结果低于此值视为异常, 夹到此值
     margin_overrides: dict[str, MarginOverride] = Field(default_factory=dict)
     margin_cache_seconds: int = 1800
+
+    # ---- 按比例跟随 / 二次调仓 ----
+    # 他调仓后 (例如清掉 BE 换成 NVDA), 新 G 会因保证金不同而变化:
+    # True = 把他其余持仓也按新 G 调到他的比例 (补仓或减仓)。
+    rebalance_on_signal: bool = True
+    rebalance_band_pct: float = 5.0  # 实际与目标相差不到 5% 的不调 (避免频繁小额交易)
 
     # ---- 盘前 / 盘后 ----
     extended_hours_buy_fraction: float = 0.5  # 盘前买入先下 50%, 其余开盘市价
@@ -99,6 +108,8 @@ class TradingConfig(_Strict):
         for name in ("extended_hours_buy_fraction", "extended_hours_sell_fraction"):
             if not 0 <= getattr(self, name) <= 1:
                 raise ValueError(f"{name} must be in [0, 1]")
+        if not 0 <= self.rebalance_band_pct < 100:
+            raise ValueError("rebalance_band_pct must be in [0, 100)")
         if not 0 < self.stop_loss_pct < 100:
             raise ValueError("stop_loss_pct must be in (0, 100)")
         if not 0 < self.default_init_margin <= 1 or not 0 < self.default_maint_margin <= 1:

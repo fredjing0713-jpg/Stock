@@ -46,9 +46,13 @@ WDC | 仓位：100.0% | 成本：422.6 | 盈亏：+0.1%
    N   = Σ w_i·init_i  + u·default_init
    G_maint = (1 - reserve_ratio) · NLV / M          # leaves 25% NLV as 剩余流动性
    G_init  = (1 - init_margin_buffer) · NLV / N     # what the broker lets us open
-   G_cap   = max_gross_leverage · NLV / max(1, ΣW)
+   G_cap   = max_gross_leverage · NLV / max(1, ΣW)     # sanity rail only (default 4.0)
    G = min(G_maint, G_init, G_cap)   (0 if NLV <= 0)
    ```
+   Liquidity first: G_maint (the 25% 剩余流动性 reserve) is the user's rule. With
+   `regt_overnight_check` (default on) every initial rate is at least 50% — IBKR liquidates
+   Reg T accounts at the close when overnight positions need more than 50% equity — so a
+   Reg T account tops out near 2x; Portfolio Margin accounts turn it off.
    Margin rates per symbol: config override → cached IBKR whatIf → config defaults; every
    rate clamped into [min_margin_rate, 1.0].
 2. **Per change line** (Intent, always a weight of G):
@@ -60,6 +64,20 @@ WDC | 仓位：100.0% | 成本：422.6 | 盈亏：+0.1%
      live positions at signal time, and does the right thing when a pre-market entry was
      only half filled.
    * Direction clamp: a buy intent never sells, a sell intent never buys, never go short.
+2b. **Proportional following (二次调仓)**: after a signal with at least one real change, his
+   other holdings (provider weight > 0, not stopped-out / ignored) get
+   `Intent(direction="both", kind="rebalance", band=rebalance_band_pct)` so that all his
+   positions are re-sized to the NEW G (a rotation into a lower-margin stock raises G → top up
+   the others; higher margin → trim them). Symbols we hold but he does not are never sold by
+   this (a partial holdings list must not liquidate anything). Outside regular hours only
+   `kind="signal"` intents trade; rebalance / confirm / sync intents wait for the open.
+2c. **Confirmations**: he broadcasts a change when he places the order and again when it fills.
+   A change line identical (symbol, from, to) to his latest change for that symbol becomes
+   `kind="confirm"` with the rebalance band: it fills a meaningful gap only, never counts as a
+   new add after a stop-out (buy confirmations for stopped-out symbols are dropped), and does
+   not trigger 二次调仓. His 成本 (cost) is never used (his app lowers it after partial
+   profit-taking); stops use our own IBKR average cost.
+2d. All share quantities are whole shares rounded down.
 3. **Live liquidity guard (always)**: IBKR pushes account values only every few minutes,
    so the account snapshot is first made conservative (`sizing.conservative_account`):
    margin usage is rebuilt from live positions × marks × margin rates and the stricter of

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 import random
 from datetime import datetime, timezone
 
@@ -27,6 +28,7 @@ from copybot.models import (
     STOP_TAG,
 )
 from copybot.sizing import (
+    rebalance_intents,
     conservative_account,
     compute_gross_target,
     deleverage_orders,
@@ -51,7 +53,10 @@ TS = datetime(2026, 10, 2, 13, 50, tzinfo=timezone.utc)
 
 
 def cfg(**kw) -> TradingConfig:
-    return TradingConfig(**kw)
+    """Vectors below were written for a 1.9x cap without the Reg T floor; pin those."""
+    opts = {"regt_overnight_check": False, "max_gross_leverage": 1.9}
+    opts.update(kw)
+    return TradingConfig(**opts)
 
 
 def acct(nlv=100_000.0, el=40_000.0, af=30_000.0, maint=0.0, init=0.0, gpv=0.0) -> AccountSnapshot:
@@ -1181,3 +1186,99 @@ def test_conservative_account_keeps_reported_values_when_they_are_stricter():
 def test_conservative_account_ignores_broken_nlv():
     broken = acct(nlv=0.0)
     assert conservative_account(broken, {"X": Position("X", 1, 1.0)}, {}, {}, cfg()) is broken
+
+
+# --------------------------------------------------------------------------- liquidity-first defaults
+
+
+def test_defaults_are_liquidity_first_with_regt_floor():
+    c = TradingConfig()
+    assert c.regt_overnight_check is True and c.max_gross_leverage == 4.0
+    # whatIf says 25% initial intraday, but Reg T needs 50% overnight.
+    r = effective_rate("X", {"X": MarginRate(0.25, 0.25, "whatif")}, c)
+    assert (r.init, r.maint) == (0.5, 0.25)
+
+
+def test_portfolio_margin_account_is_limited_by_the_liquidity_reserve():
+    c = TradingConfig(regt_overnight_check=False)
+    rates = {"A": MarginRate(0.2, 0.15), "B": MarginRate(0.2, 0.15)}
+    g = compute_gross_target(100_000, {"A": 0.5, "B": 0.5}, rates, c)
+    assert g.g_maint == pytest.approx(500_000)  # 75k / 15%
+    assert g.gross == pytest.approx(400_000) and g.binding == "leverage_cap"  # sanity rail only
+    rates = {"A": MarginRate(0.4, 0.4), "B": MarginRate(0.5, 0.5)}
+    g = compute_gross_target(100_000, {"A": 0.5, "B": 0.5}, rates, c)
+    assert g.binding == "reserve" and g.gross == pytest.approx(75_000 / 0.45)
+
+
+def test_regt_account_overnight_limit():
+    g = compute_gross_target(100_000, {"A": 1.0}, {"A": MarginRate(0.25, 0.25)}, TradingConfig())
+    assert g.binding == "init_margin" and g.gross == pytest.approx(98_000 / 0.5)
+    # High-margin stock: the 25% liquidity reserve binds before Reg T.
+    g = compute_gross_target(100_000, {"A": 1.0}, {"A": MarginRate(0.5, 0.45)}, TradingConfig())
+    assert g.binding == "reserve" and g.gross == pytest.approx(75_000 / 0.45)
+
+
+# --------------------------------------------------------------------------- 二次调仓 (rebalance)
+
+
+def test_rebalance_intents_cover_his_other_holdings_only():
+    weights = {"RKLB": 1 / 3, "MU": 1 / 3, "NVDA": 1 / 3}
+    out = rebalance_intents(weights, exclude={"NVDA", "BE"}, band=0.05, signal_key="k")
+    assert [(i.symbol, i.direction, i.kind, i.band) for i in out] == [
+        ("MU", "both", "rebalance", 0.05),
+        ("RKLB", "both", "rebalance", 0.05),
+    ]
+
+
+def test_rotation_into_lower_margin_stock_tops_up_the_others():
+    c = cfg(min_order_value_usd=0, regt_overnight_check=False, max_gross_leverage=10)
+    rates = {"RKLB": MarginRate(0.4, 0.4), "MU": MarginRate(0.4, 0.4), "BE": MarginRate(0.7, 0.7),
+             "NVDA": MarginRate(0.25, 0.25)}
+    before = compute_gross_target(100_000, {"RKLB": 1 / 3, "MU": 1 / 3, "BE": 1 / 3}, rates, c).gross
+    after = compute_gross_target(100_000, {"RKLB": 1 / 3, "MU": 1 / 3, "NVDA": 1 / 3}, rates, c).gross
+    assert after > before
+    quotes = {s: Quote(s, 99.9, 100.0, 100.0) for s in rates}
+    held = int(before / 3 / 100)
+    positions = {"RKLB": Position("RKLB", held, 100.0), "MU": Position("MU", held, 100.0)}
+    intents = rebalance_intents({"RKLB": 1 / 3, "MU": 1 / 3, "NVDA": 1 / 3}, {"NVDA"}, 0.05)
+    orders, _ = resolve_intents(intents, positions, quotes, after, c)
+    assert {(o.symbol, o.side) for o in orders} == {("RKLB", Side.BUY), ("MU", Side.BUY)}
+    for o in orders:
+        assert o.target_qty == int(after / 3 / 100) and isinstance(o.qty, int)
+
+
+def test_rotation_into_higher_margin_stock_trims_the_others():
+    c = cfg(min_order_value_usd=0, regt_overnight_check=False, max_gross_leverage=10)
+    rates = {"RKLB": MarginRate(0.4, 0.4), "MU": MarginRate(0.4, 0.4), "NVDA": MarginRate(0.25, 0.25),
+             "BE": MarginRate(0.7, 0.7)}
+    before = compute_gross_target(100_000, {"RKLB": 1 / 3, "MU": 1 / 3, "NVDA": 1 / 3}, rates, c).gross
+    after = compute_gross_target(100_000, {"RKLB": 1 / 3, "MU": 1 / 3, "BE": 1 / 3}, rates, c).gross
+    assert after < before
+    quotes = {s: Quote(s, 99.9, 100.0, 100.0) for s in rates}
+    held = int(before / 3 / 100)
+    positions = {"RKLB": Position("RKLB", held, 100.0), "MU": Position("MU", held, 100.0)}
+    orders, _ = resolve_intents(rebalance_intents({"RKLB": 1 / 3, "MU": 1 / 3, "BE": 1 / 3}, {"BE"}, 0.05),
+                                positions, quotes, after, c)
+    assert {(o.symbol, o.side) for o in orders} == {("RKLB", Side.SELL), ("MU", Side.SELL)}
+
+
+def test_rebalance_band_skips_small_differences():
+    c = cfg(min_order_value_usd=0)
+    quotes = {"MU": Quote("MU", 99.9, 100.0, 100.0)}
+    positions = {"MU": Position("MU", 97, 100.0)}  # target 100 → 3% off
+    intents = rebalance_intents({"MU": 0.5}, set(), 0.05)
+    assert resolve_intents(intents, positions, quotes, 20_000, c) == ([], [])
+    positions = {"MU": Position("MU", 90, 100.0)}  # 10% off → top up 10
+    orders, _ = resolve_intents(intents, positions, quotes, 20_000, c)
+    assert [(o.side, o.qty) for o in orders] == [(Side.BUY, 10)]
+
+
+def test_all_order_quantities_are_whole_shares_rounded_down():
+    c = cfg(min_order_value_usd=0)
+    quotes = {"X": Quote("X", 333.0, 333.3, 333.2)}
+    intent = Intent("X", 0.5, "buy")
+    orders, _ = resolve_intents([intent], {}, quotes, 100_000, c)
+    assert orders[0].qty == 150  # 50,000 / 333.3 = 150.01… → 150
+    assert split_extended(orders, 0.5, 1.0)[0].qty == 75
+    scaled, _ = scale_buys_for_liquidity([replace(orders[0], qty=151)], acct(el=40_000, af=30_000), {"X": MarginRate(0.5, 0.4)}, c)
+    assert all(isinstance(o.qty, int) for o in scaled)

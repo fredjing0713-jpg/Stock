@@ -264,6 +264,12 @@ class Intent:
     same intent is idempotent.
     direction limits the trade: "buy" never sells, "sell" never buys, "both" either.
     target_weight == 0 means "close the position" and needs no price.
+    kind:
+      "signal"    — a change line of his signal (only kind traded in pre/after-hours)
+      "confirm"   — the same change broadcast again (he re-announces it when it fills)
+      "rebalance" — his unchanged holdings, re-sized to the new G after a 调仓
+      "sync"      — !sync
+    band: skip the trade when |delta| < band · target (avoids churn); 0 = always trade.
     """
 
     symbol: str
@@ -272,6 +278,8 @@ class Intent:
     signal_price: float | None = None  # provider 成交价, for the chase / deviation guard
     reason: str = ""  # human readable, e.g. "建仓 0%→100%"
     signal_key: str = ""  # fingerprint of the originating signal ("sync" for !sync)
+    kind: Literal["signal", "confirm", "rebalance", "sync"] = "signal"
+    band: float = 0.0
 
 
 @dataclass(frozen=True)

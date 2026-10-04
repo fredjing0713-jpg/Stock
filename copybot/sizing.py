@@ -38,6 +38,8 @@ _EPS = 1e-9
 _QTY_EPS = 1e-6
 # Two stop prices closer than this (half a cent) are considered equal.
 STOP_PRICE_TOLERANCE = 0.005
+# Reg T end-of-day initial margin for long stock: overnight positions need 50% equity.
+REGT_INIT_MARGIN = 0.50
 
 # Skip reasons (user-facing, Simplified Chinese).
 SKIP_SHORT = "空头持仓，不处理"
@@ -48,6 +50,7 @@ SKIP_BAD_WEIGHT = "目标仓位无效"
 SKIP_BAD_DIRECTION = "未知方向"
 NOTE_SYNC = "同步"
 NOTE_DELEVERAGE = "降杠杆"
+NOTE_REBALANCE = "再平衡"
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -141,10 +144,17 @@ def _rate_is_valid(rate: MarginRate | None) -> bool:
 
 
 def _clamp_rate(rate: MarginRate, cfg: TradingConfig) -> MarginRate:
-    """Clamp init / maint into [min_margin_rate, 1] and make init >= maint."""
+    """Clamp init / maint into [min_margin_rate, 1] and make init >= maint.
+
+    With regt_overnight_check the initial rate is at least 50%: IBKR's intraday
+    initial margin can be lower, but a Reg T account is liquidated at the close
+    when overnight positions need more than 50% equity.
+    """
     lo = min(max(cfg.min_margin_rate, 0.0), 1.0)
     maint = min(max(rate.maint, lo), 1.0)
     init = min(max(rate.init, lo), 1.0)
+    if cfg.regt_overnight_check:
+        init = max(init, REGT_INIT_MARGIN)
     return MarginRate(init=max(init, maint), maint=maint, source=rate.source)
 
 
@@ -256,6 +266,39 @@ def intents_for_sync(
 
 
 # --------------------------------------------------------------------------- intents → orders
+
+
+def rebalance_intents(
+    weights: Mapping[str, float],
+    exclude: Iterable[str],
+    band: float,
+    signal_key: str = "",
+) -> list[Intent]:
+    """After a 调仓, re-size his other holdings to the new G (二次调仓).
+
+    One "both" intent per symbol he holds (weight > 0) that is not excluded (the
+    signal's own symbols, stopped-out and ignored symbols), with a tolerance band.
+    Symbols we hold but he does not are left alone (a partial holdings list must
+    never sell them); the consistency check / !sync handle those.
+    """
+    skip = {s.upper() for s in exclude}
+    out: list[Intent] = []
+    for sym in sorted(weights):
+        w = weights[sym]
+        if sym.upper() in skip or not math.isfinite(w) or w <= 0:
+            continue
+        out.append(
+            Intent(
+                symbol=sym,
+                target_weight=w,
+                direction="both",
+                reason=NOTE_REBALANCE,
+                signal_key=signal_key,
+                kind="rebalance",
+                band=band,
+            )
+        )
+    return out
 
 
 def _sizing_price(direction: str, quote: Quote, signal_price: float | None) -> float | None:
@@ -416,7 +459,8 @@ def resolve_intents(
     buys: list[PlannedOrder] = []
     skips: list[SkipNote] = []
     for intent in _last_per_symbol(intents):
-        result = _resolve_one(intent, positions, quotes, gross, cfg, sync_band)
+        band = max(sync_band, intent.band if math.isfinite(intent.band) else 0.0)
+        result = _resolve_one(intent, positions, quotes, gross, cfg, band)
         if isinstance(result, SkipNote):
             skips.append(result)
         elif isinstance(result, PlannedOrder):
