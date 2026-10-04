@@ -259,18 +259,16 @@ class Fill:
 class Intent:
     """What we want for one symbol, independent of *when* it is executed.
 
-    mode == "weight": target market value = target_weight × gross target (G);
-                      recomputed at execution time with fresh prices / NLV.
-    mode == "qty":    absolute share target decided when the signal arrived
-                      (used for 减仓 / 清仓, which are proportional to our holding).
+    The target is always a weight of G (the "100% 仓位" dollar amount), so it is
+    re-sized with fresh prices / NLV whenever it is executed and re-executing the
+    same intent is idempotent.
     direction limits the trade: "buy" never sells, "sell" never buys, "both" either.
+    target_weight == 0 means "close the position" and needs no price.
     """
 
     symbol: str
-    mode: Literal["weight", "qty"]
+    target_weight: float
     direction: Literal["buy", "sell", "both"]
-    target_weight: float | None = None
-    target_qty: int | None = None
     signal_price: float | None = None  # provider 成交价, for the chase / deviation guard
     reason: str = ""  # human readable, e.g. "建仓 0%→100%"
     signal_key: str = ""  # fingerprint of the originating signal ("sync" for !sync)
@@ -328,3 +326,12 @@ class StopActions:
     @property
     def empty(self) -> bool:
         return not (self.create or self.modify or self.cancel)
+
+
+@dataclass(frozen=True)
+class MessageMeta:
+    """Where a Discord message came from."""
+
+    message_id: str
+    author_id: int
+    received_at: datetime  # tz-aware

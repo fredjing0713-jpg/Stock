@@ -51,12 +51,14 @@ WDC | 仓位：100.0% | 成本：422.6 | 盈亏：+0.1%
    ```
    Margin rates per symbol: config override → cached IBKR whatIf → config defaults; every
    rate clamped into [min_margin_rate, 1.0].
-2. **Per change line** (Intent):
-   * increase (建仓/加仓): `mode="weight", target_weight=to, direction="buy"`;
+2. **Per change line** (Intent, always a weight of G):
+   * increase (建仓/加仓): `Intent(sym, target_weight=to, direction="buy")`;
      target shares = floor(to·G / buy_ref_price).
-   * decrease to 0 (清仓): `mode="qty", target_qty=0, direction="sell"`.
-   * partial decrease (减仓): proportional to OUR holding:
-     `target_qty = floor(current_qty · to / from)`, `direction="sell"`.
+   * decrease (减仓/清仓): `Intent(sym, target_weight=to, direction="sell")`;
+     target shares = floor(to·G / price), or 0 when to == 0 (no price needed).
+     Weight-based (not "sell the same ratio of our shares") so it is idempotent, needs no
+     live positions at signal time, and does the right thing when a pre-market entry was
+     only half filled.
    * Direction clamp: a buy intent never sells, a sell intent never buys, never go short.
 3. **Live liquidity guard (always)**: before buys, estimate post-sell account
    (EL' = EL + Σ sold_value·maint_i, AF' = AF + Σ sold_value·init_i, GPV' = GPV − Σ sold_value)
@@ -96,7 +98,7 @@ WDC | 仓位：100.0% | 成本：422.6 | 盈亏：+0.1%
    every managed position, `s = min(1, (reserve·NLV − EL) / Σ_managed value_i·maint_i)`,
    qty_i = ceil(qty_i·s). Runs even when paused (it is protective). Alert with @owner.
 8. **!sync**: rebalance every managed symbol to the provider's last known portfolio at the
-   current G (`mode="weight", direction="both"`; provider weight 0 for symbols we hold but he
+   current G (`direction="both"`; provider weight 0 for symbols we hold but he
    doesn't). Skip symbols whose |delta value| < 5% of target value (avoid churn).
    Two-step: `!sync` shows the plan, `!sync confirm` within 180 s executes it via the normal
    session rules.
@@ -136,12 +138,13 @@ def round_to_tick(price: float, side: Side | None = None) -> float
 def effective_rate(symbol, rates: dict[str, MarginRate], cfg: TradingConfig) -> MarginRate
     # override → rates[symbol] → default; clamp to [min_margin_rate, 1]
 def compute_gross_target(nlv, weights: dict[str, float], rates, cfg) -> GrossTarget
-def intents_from_signal(signal: Signal, positions: dict[str, Position], ignore: set[str]) -> list[Intent]
+def intents_from_signal(signal: Signal, ignore: set[str]) -> list[Intent]   # last line wins per symbol
 def intents_for_sync(provider_weights: dict[str, float], positions, ignore: set[str]) -> list[Intent]
 def resolve_intents(intents, positions, quotes: dict[str, Quote], gross: float, cfg,
                     *, sync_band: float = 0.0) -> tuple[list[PlannedOrder], list[SkipNote]]
-    # weight → floor(w·G/price) (buy side uses buy_ref, sell side uses sell_ref; fall back to
-    # mark(), then signal_price); qty → target_qty; delta clamped by direction, never short;
+    # target = 0 if w <= 0 else floor(w·G/price); price: "buy" → buy_ref, "sell" → sell_ref,
+    # "both" → mark(); each falls back to mark() then signal_price; no price and w > 0 →
+    # SkipNote. delta clamped by direction, never short (sell qty <= current);
     # deviation guard for buys; min_order_value (closing sells exempt); sync_band skips
     # |delta·price| < sync_band·target_value (only when target_value > 0).
 def estimate_after_sells(account: AccountSnapshot, sold: list[tuple[str, int, float]],
@@ -238,7 +241,7 @@ async sync_preview() -> str; async sync_confirm() -> str
 async cancel_all() -> str              # cancel working non-stop bot orders + clear pending
 def pause(); def resume(); async status_text() -> str
 ```
-`MessageMeta(message_id: str, author_id: int, received_at: datetime)`.
+`MessageMeta` lives in `copybot.models` (message_id: str, author_id: int, received_at: datetime).
 One `asyncio.Lock` serialises every trading action (signals, scheduler, sync, deleverage,
 stop sync). The fill handler never takes the lock; it records, notifies and pokes the
 stop-sync loop.
