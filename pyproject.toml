@@ -1,0 +1,26 @@
+[project]
+name = "copybot"
+version = "0.1.0"
+description = "Discord 信号跟单 → IBKR 自动下单"
+requires-python = ">=3.11"
+dependencies = [
+    "ib_async>=2.0,<3",
+    "discord.py>=2.5,<3",
+    "holidays>=0.60",
+    "pydantic>=2.6,<3",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["copybot*"]
