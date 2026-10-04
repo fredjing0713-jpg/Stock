@@ -925,3 +925,77 @@ async def test_app_run_wires_components_and_shuts_down(monkeypatch, tmp_path):
     assert client.engine._tasks == []
     assert fake.connected is False  # broker.disconnect() on shutdown
     assert (tmp_path / "db" / "copybot.db").exists()
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+async def test_premarket_rotation_buys_half_after_sells_fill(make):
+    """At full leverage the pre-market buy leg must be funded by the pre-market sells."""
+    env = make(at=ny(2026, 10, 2, 8, 0, 3), cash=-90_000.0)
+    b = env.broker
+    b.set_position("BE", 475, 200.0)
+    b.set_quote("BE", 199.9, 200.1, 200.0)
+    b.set_position("ARM", 760, 125.0)
+    b.set_quote("ARM", 124.9, 125.1, 125.0)
+    b.set_quote("WDC", 422.4, 422.8, 422.6)
+    b.rates["WDC"] = MarginRate(0.30, 0.25, "whatif")
+    b.auto_fill_limits = True
+    text = EXAMPLE.replace("09:50:59", "08:00:00")
+
+    await env.send(text)
+
+    assert b.qty("BE") == 0 and b.qty("ARM") == 0
+    wdc = [r for r in b.placed if r.symbol == "WDC"]
+    assert len(wdc) == 1 and wdc[0].order_type == LMT and wdc[0].outside_rth
+    assert 200 <= wdc[0].qty <= 225  # about half of the ~448-share target
+
+
+async def test_stale_signal_cancels_leftover_premarket_order(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3))
+    b = env.broker
+    b.set_quote("X", 99.9, 100.1, 100.0)
+    await env.send(signal(["建仓 X | 仓位：0.0% → 50.0% | 成交价：100"], ["X | 仓位：50.0% | 成本：100 | 盈亏：0.0%"], "2026-10-02 08:00:00"))
+    assert len(b.working("X", LMT)) == 1
+
+    env.clock.set(ny(2026, 10, 2, 8, 45, 0))  # the exit arrives 15 min late → stale, not traded
+    await env.send(signal(["清仓 X | 仓位：50.0% → 0.0% | 成交价：无"], [], "2026-10-02 08:30:00"))
+
+    assert b.working("X", LMT) == []
+    assert env.store.list_pending() == []
+    assert "已撤销旧挂单" in env.texts()[-1]
+
+
+async def test_stop_fill_cancels_leftover_premarket_buy(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3))
+    b = env.broker
+    b.set_position("W", 100, 50.0)
+    b.set_quote("W", 49.9, 50.1, 50.0)
+    await env.engine.sync_stops()
+    await env.send(signal(["加仓 W | 仓位：30.0% → 50.0% | 成交价：50"], None, "2026-10-02 08:00:00"))
+    assert len(b.working("W", LMT)) == 1
+
+    await b.trigger_stop("W")
+    await asyncio.sleep(0)  # let the spawned cancel task run
+    for _ in range(20):
+        if not env.engine._bg:
+            break
+        await asyncio.sleep(0.01)
+
+    assert b.working("W", LMT) == []
+    assert "W" in env.store.stopped()
+    assert env.store.list_pending() == []
+
+
+async def test_stale_add_after_stop_out_clears_mark_so_sync_can_reenter(make):
+    env = make()
+    b = env.broker
+    b.set_quote("W", 49.9, 50.1, 50.0)
+    env.store.mark_stopped("W", ny(2026, 10, 2, 9, 35, 0), 100, 45.0)
+    env.clock.set(ny(2026, 10, 2, 10, 16, 0))
+
+    await env.send(signal(["加仓 W | 仓位：30.0% → 50.0% | 成交价：46"], ["W | 仓位：50.0% | 成本：48 | 盈亏：-4.0%"], "2026-10-02 10:05:00"))
+    assert b.placed == [] and "W" not in env.store.stopped()
+
+    preview = await env.engine.sync_preview()
+    assert "买入 W" in preview

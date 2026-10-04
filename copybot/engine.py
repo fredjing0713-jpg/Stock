@@ -300,6 +300,7 @@ class Engine:
         self._last_positions: dict[str, Position] = {}
         self._sync_preview_at: datetime | None = None
         self._stop_fill_mono: dict[str, float] = {}  # symbol → monotonic time of last stop fill
+        self._bg: set[asyncio.Task] = set()  # fire-and-forget tasks (kept referenced)
         self._last_stop_note: tuple[str, float] = ("", 0.0)
         # Tunables (tests shorten them).
         self.cancel_wait_seconds = CANCEL_WAIT_SECONDS
@@ -394,7 +395,7 @@ class Engine:
     async def stop(self) -> None:
         """Stop the loops and wait (bounded) for an in-flight trading action."""
         self._closed = True
-        tasks, self._tasks = self._tasks, []
+        tasks, self._tasks = self._tasks + list(self._bg), []
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -453,6 +454,7 @@ class Engine:
                 self._stop_fill_mono[sym] = time.monotonic()
                 self._mark_stopped(fill)
                 self.store.delete_pending(sym)
+                self._spawn(self._cancel_after_stop(sym))
                 await self._notify(
                     f"🛑 止损触发 {sym} 卖出 {fill.qty}股 @ {_px(fill.price)}；"
                     f"他之后对 {sym} 建仓/加仓时会重新跟入",
@@ -465,6 +467,38 @@ class Engine:
             await self._fail("处理成交回报", exc)
         finally:
             self._poke_stops()
+
+    def _spawn(self, coro: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def _cancel_after_stop(self, symbol: str) -> None:
+        """After a stop-out, leftover pre-market / after-hours orders must not re-buy."""
+        if self._closed:
+            return
+        async with self._lock:
+            try:
+                if not self.broker.is_connected():
+                    return
+                note = await self._cancel_leftovers({symbol})
+                if note:
+                    await self._notify(f"🧹 {symbol} 止损后{note}", level="warn")
+            except Exception as exc:
+                await self._fail(f"止损后撤销 {symbol} 挂单", exc)
+
+    async def _cancel_leftovers(self, symbols: set[str]) -> str:
+        """Cancel our non-stop working orders for `symbols`; returns a short note ('' if none)."""
+        working = [
+            o for o in await self.broker.open_orders() if not o.is_stop and not o.is_done and o.symbol in symbols
+        ]
+        if not working:
+            return ""
+        still = await self._cancel_and_wait(working)
+        note = "已撤销旧挂单：" + "、".join(f"{o.symbol} {_side_cn(o.side)}{o.remaining}股" for o in working)
+        if still:
+            note += "；❌ 未能撤销：" + "、".join(f"{o.symbol}({o.order_id})" for o in still)
+        return note
 
     def _mark_stopped(self, fill: Fill) -> None:
         """Remember the stop-out; partial fills close together add up."""
@@ -552,30 +586,30 @@ class Engine:
         if odd:
             rep.add(f"⚠️ 有 {len(odd)} 行无法识别（持仓明细按未知处理）：{' / '.join(odd[:3])}", "warn")
 
+        # A new signal for a stopped-out symbol ends its stop-out mark — also when it is
+        # not traded (paused / stale), so that the advised !sync can follow him back in.
+        reentered = self._clear_stopped(sig)
+
         # 4. paused
         if self.is_paused:
             self._record(sig, meta.message_id, sig_ts, "paused", summary)
-            await self._notify(f"⏸️ 已暂停，未执行: {summary}{self._drop_superseded(sig)}")
+            await self._notify(f"⏸️ 已暂停，未执行: {summary}{await self._drop_superseded(sig)}")
             return
 
         # 5. stale
         if age > self._t.max_signal_age_seconds:
             self._record(sig, meta.message_id, sig_ts, "stale", summary)
             await self._notify(
-                f"信号已过期 {age:.0f} 秒，未交易（可用 !sync 对齐）：{summary}{self._drop_superseded(sig)}",
+                f"信号已过期 {age:.0f} 秒，未交易（可用 !sync 对齐）：{summary}{await self._drop_superseded(sig)}",
                 level="warn",
                 mention=True,
             )
             return
 
-        # 6. intents; a stopped-out symbol re-enters on any new signal for it
+        # 6. intents (a stopped-out symbol with an add / open signal is bought back)
         intents = intents_from_signal(sig, self._ignore)
-        stopped = self.store.stopped()
-        for it in intents:
-            if it.symbol in stopped:
-                self.store.clear_stopped(it.symbol)
-                if it.direction == "buy":
-                    rep.add(f"🔁 {it.symbol} 止损后重新跟入")
+        for sym in reentered:
+            rep.add(f"🔁 {sym} 止损后重新跟入")
 
         # 7. execute by session
         status = "no_action"
@@ -607,13 +641,40 @@ class Engine:
         if sem is not None:
             self.store.record_signal(sem, message_id, ts, status, summary)
 
-    def _drop_superseded(self, sig: Signal) -> str:
-        """A newer (untraded) signal makes older pending intents of its symbols obsolete."""
-        changed = {c.symbol for c in sig.changes}
+    def _clear_stopped(self, sig: Signal) -> list[str]:
+        """Clear stop-out marks of the signal's symbols; returns those with an increase."""
+        stopped = self.store.stopped()
+        reentered: list[str] = []
+        for ch in sig.changes:
+            if ch.symbol in stopped and ch.symbol not in self._ignore:
+                self.store.clear_stopped(ch.symbol)
+                stopped.pop(ch.symbol)
+                if ch.is_increase:
+                    reentered.append(ch.symbol)
+        return reentered
+
+    async def _drop_superseded(self, sig: Signal) -> str:
+        """A newer (untraded) signal makes older pending intents of its symbols obsolete.
+
+        Their leftover pre-market / after-hours limit orders are cancelled too, otherwise
+        they could still fill later that day.
+        """
+        changed = {c.symbol for c in sig.changes} - self._ignore
         dropped = sorted(it.symbol for it, _ in self.store.list_pending() if it.symbol in changed)
         for sym in dropped:
             self.store.delete_pending(sym)
-        return f"\n已取消被新信号取代的待开盘任务：{'、'.join(dropped)}" if dropped else ""
+        notes: list[str] = []
+        if dropped:
+            notes.append(f"已取消被新信号取代的待开盘任务：{'、'.join(dropped)}")
+        if changed and self.broker.is_connected():
+            try:
+                note = await self._cancel_leftovers(changed)
+            except Exception as exc:
+                log.exception("cancel superseded orders failed")
+                note = f"⚠️ 撤销旧挂单失败：{type(exc).__name__}: {exc}"
+            if note:
+                notes.append(note)
+        return "".join(f"\n{n}" for n in notes)
 
     def _update_portfolio(self, sig: Signal, ts: datetime | None) -> None:
         """Provider weights after this signal: 持仓明细 if present, else last known + changes."""
@@ -946,7 +1007,20 @@ class Engine:
         placed = await self._place_sells(sell_pairs, ctx.started, rep)
 
         ext_buys = [x for x in ext if x.side == Side.BUY]
-        scaled, s = scale_buys_for_liquidity(ext_buys, ctx.account, ctx.rates, self._t)
+        account = ctx.account
+        if ext_buys and placed:
+            # Rotation (sell A, buy B): marketable sell limits usually fill within seconds;
+            # wait for them and credit what filled, like the regular-hours path does.
+            timeout = float(self._t.fill_timeout_seconds)
+            finals = await asyncio.gather(*(self._wait_done(info, timeout) for _, info in placed))
+            placed = [(o, info) for (o, _), info in zip(placed, finals, strict=True)]
+            sold = [
+                (o.symbol, info.filled_qty, info.avg_fill_price or o.ref_price)
+                for o, info in placed
+                if info.filled_qty > 0
+            ]
+            account = estimate_after_sells(account, sold, ctx.rates, self._t)
+        scaled, s = scale_buys_for_liquidity(ext_buys, account, ctx.rates, self._t)
         self._report_scaling(rep, ext_buys, scaled, s)
         buy_pairs: list[tuple[PlannedOrder, OrderRequest]] = []
         for o in scaled:
@@ -1452,6 +1526,8 @@ class Engine:
                 await self._handle_signal(sig, MessageMeta("history", 0, now))
                 return True
         newer =pf is None if ts is None else (stored_ts is None or ts > stored_ts)
+        if missed:
+            self._clear_stopped(sig)  # so the advised !sync can follow him back in
         if newer:
             self._update_portfolio(sig, ts)
             if ts is not None and (last is None or ts > last):
