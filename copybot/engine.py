@@ -58,6 +58,7 @@ from .notifier import Notifier
 from .parser import parse_signal, suspicious_lines
 from .sizing import (
     compute_gross_target,
+    conservative_account,
     deleverage_orders,
     desired_stops,
     diff_stops,
@@ -236,10 +237,11 @@ class _Context:
 
     positions: dict[str, Position]
     quotes: dict[str, Quote]
-    account: AccountSnapshot
+    account: AccountSnapshot  # conservative: reported values vs. live positions × margin rates
     rates: dict[str, MarginRate]
     gross: GrossTarget
     started: float  # time.monotonic() when the snapshot was started
+    raw_account: AccountSnapshot  # exactly as reported by the broker
 
 
 @dataclass
@@ -666,10 +668,12 @@ class Engine:
             weights = {i.symbol: i.target_weight for i in intents if i.target_weight > 0}
         wanted = sorted(set(symbols) | set(weights) | set(positions))
         quotes = dict(await self.broker.quotes(wanted)) if wanted else {}
-        account = await self.broker.account()
-        rates = await self._rates(wanted, quotes, account.net_liquidation)
-        gross = compute_gross_target(account.net_liquidation, weights, rates, self._t)
-        return _Context(positions, quotes, account, rates, gross, started)
+        raw = await self.broker.account()
+        rates = await self._rates(wanted, quotes, raw.net_liquidation)
+        # Broker account values can lag minutes behind fills; positions do not.
+        account = conservative_account(raw, positions, quotes, rates, self._t)
+        gross = compute_gross_target(raw.net_liquidation, weights, rates, self._t)
+        return _Context(positions, quotes, account, rates, gross, started, raw)
 
     async def _rates(
         self, symbols: Iterable[str], quotes: Mapping[str, Quote], nlv: float
@@ -1160,13 +1164,14 @@ class Engine:
     async def _deleverage(self, now: datetime) -> bool:
         """Sell the same fraction of every managed long; True if orders were attempted."""
         ctx = await self._gather_context(())
+        # Use the broker's own numbers here: the conservative model could oversell.
         orders = deleverage_orders(
-            ctx.account, ctx.positions, ctx.quotes, ctx.rates, self._t, self.cfg.risk, self._ignore
+            ctx.raw_account, ctx.positions, ctx.quotes, ctx.rates, self._t, self.cfg.risk, self._ignore
         )
         if not orders:
             return False
         self.store.set(KV_LAST_DELEVERAGE_TS, now)
-        before = ctx.account
+        before = ctx.raw_account
         rep = _Report(level="error", mention=True)
         rep.add(
             f"🚨 剩余流动性 {before.el_ratio:.1%} 低于 {self.cfg.risk.deleverage_trigger_ratio:.0%}，自动按比例降杠杆"
@@ -1438,7 +1443,15 @@ class Engine:
         # Newer than everything handled so far (and not the very first run): it was
         # posted while the bot was offline and will never be traded automatically.
         missed = ts is not None and last is not None and ts > last and bool(sig.changes)
-        newer = pf is None if ts is None else (stored_ts is None or ts > stored_ts)
+        if missed and ts is not None:
+            now = self._now()
+            if (now - ts).total_seconds() <= self._t.max_signal_age_seconds:
+                # Posted while the bot was restarting and still fresh: trade it like a
+                # live signal (re-trading is idempotent because targets are weights).
+                log.info("bootstrap: fresh unprocessed signal %s, handling it live", sig.fingerprint[:8])
+                await self._handle_signal(sig, MessageMeta("history", 0, now))
+                return True
+        newer =pf is None if ts is None else (stored_ts is None or ts > stored_ts)
         if newer:
             self._update_portfolio(sig, ts)
             if ts is not None and (last is None or ts > last):

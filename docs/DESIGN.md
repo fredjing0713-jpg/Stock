@@ -60,7 +60,10 @@ WDC | 仓位：100.0% | 成本：422.6 | 盈亏：+0.1%
      live positions at signal time, and does the right thing when a pre-market entry was
      only half filled.
    * Direction clamp: a buy intent never sells, a sell intent never buys, never go short.
-3. **Live liquidity guard (always)**: before buys, estimate post-sell account
+3. **Live liquidity guard (always)**: IBKR pushes account values only every few minutes,
+   so the account snapshot is first made conservative (`sizing.conservative_account`):
+   margin usage is rebuilt from live positions × marks × margin rates and the stricter of
+   reported vs. modelled EL / AF / GPV is used. Then, before buys, estimate post-sell account
    (EL' = EL + Σ sold_value·maint_i, AF' = AF + Σ sold_value·init_i, GPV' = GPV − Σ sold_value)
    and scale ALL buys of the batch by one factor
    `s = clamp(min(room_maint/need_maint, room_init/need_init, room_gross/need_gross), 0, 1)`
@@ -251,7 +254,9 @@ stop-sync loop.
 `class CopyBotClient(discord.Client)`: intents default + message_content. Signal channel +
 allowed authors → `engine.handle_text`. Command channel + owner_ids → commands
 `!status !pause !resume !sync [confirm] !cancel !help`. `on_ready` → bootstrap provider
-portfolio from the last 20 messages of the signal channel (no trading).
+portfolio from the last 20 messages of the signal channel. A history signal that was never
+processed, is newer than the last handled one and is still fresh (≤ max_signal_age_seconds,
+i.e. posted during a restart) is traded like a live signal; older missed ones only warn.
 
 ### 3.10 `copybot/app.py` / `copybot/__main__.py`
 Load config, logging (stdout + rotating file), Store, IBKRBroker (wrapped in DryRunBroker

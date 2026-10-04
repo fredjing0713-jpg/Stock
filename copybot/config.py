@@ -151,10 +151,17 @@ def load_config(path: str | os.PathLike | None = None) -> AppConfig:
         ib["host"] = os.environ["IBKR_HOST"]
     if os.environ.get("IBKR_PORT"):
         ib["port"] = int(os.environ["IBKR_PORT"])
-    if os.environ.get("COPYBOT_DRY_RUN"):
-        raw.setdefault("trading", {})
-        raw["trading"] = raw["trading"] or {}
-        raw["trading"]["dry_run"] = os.environ["COPYBOT_DRY_RUN"].strip().lower() in ("1", "true", "yes")
+    dry = os.environ.get("COPYBOT_DRY_RUN", "").strip().lower()
+    if dry:
+        # Strict on purpose: a typo must never silently switch on live trading.
+        if dry in ("1", "true", "yes"):
+            value = True
+        elif dry in ("0", "false", "no"):
+            value = False
+        else:
+            raise ValueError(f"COPYBOT_DRY_RUN must be true/false/1/0/yes/no, got {dry!r}")
+        raw["trading"] = raw.get("trading") or {}
+        raw["trading"]["dry_run"] = value
     return AppConfig.model_validate(raw)
 
 

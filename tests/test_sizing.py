@@ -27,6 +27,7 @@ from copybot.models import (
     STOP_TAG,
 )
 from copybot.sizing import (
+    conservative_account,
     compute_gross_target,
     deleverage_orders,
     desired_stops,
@@ -1152,3 +1153,31 @@ def test_resolve_sync_band_is_silent_even_when_below_min_value():
     # outside the band but still tiny → reported
     out = resolve_intents([both("A", 0.5)], positions(pos("A", 92)), quotes, 2_000, cfg(), sync_band=0.05)
     assert out == ([], [SkipNote("A", "金额太小")])
+
+
+# --------------------------------------------------------------------------- conservative_account
+
+
+def test_conservative_account_catches_stale_values_after_a_buy():
+    # Reported values are from before we bought 300 X @ 500 (maint .4, init .5).
+    stale = acct(nlv=100_000, el=100_000, af=100_000, gpv=0)
+    positions = {"X": Position("X", 300, 500.0)}
+    quotes = {"X": Quote("X", 499.0, 501.0, 500.0)}
+    rates = {"X": MarginRate(0.5, 0.4, "whatif")}
+    out = conservative_account(stale, positions, quotes, rates, cfg())
+    assert out.gross_position_value == pytest.approx(150_000)
+    assert out.excess_liquidity == pytest.approx(100_000 - 60_000)
+    assert out.available_funds == pytest.approx(100_000 - 75_000)
+    assert out.net_liquidation == 100_000
+
+
+def test_conservative_account_keeps_reported_values_when_they_are_stricter():
+    reported = acct(nlv=100_000, el=10_000, af=5_000, gpv=200_000)
+    positions = {"X": Position("X", 100, 500.0)}
+    out = conservative_account(reported, positions, {}, {"X": MarginRate(0.5, 0.4)}, cfg())
+    assert (out.excess_liquidity, out.available_funds, out.gross_position_value) == (10_000, 5_000, 200_000)
+
+
+def test_conservative_account_ignores_broken_nlv():
+    broken = acct(nlv=0.0)
+    assert conservative_account(broken, {"X": Position("X", 1, 1.0)}, {}, {}, cfg()) is broken

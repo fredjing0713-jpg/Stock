@@ -720,10 +720,11 @@ async def test_bootstrap_updates_portfolio_marks_seen_and_never_trades(make):
     assert not any("错过信号" in t for t in env.texts())  # first run: nothing counts as missed
 
 
-async def test_bootstrap_warns_about_signals_missed_while_offline(make):
+async def test_bootstrap_warns_about_old_signals_missed_while_offline(make):
     env = make(cash=0.0)
     example_account(env.broker)
     env.store.set("last_signal_ts", ny(2026, 10, 2, 9, 40, 0))  # newest signal handled before the restart
+    env.clock.set(ny(2026, 10, 2, 10, 30, 0))  # 39 min after the missed signal: too old to trade
 
     assert await env.engine.bootstrap_from_text(EXAMPLE)
 
@@ -731,6 +732,21 @@ async def test_bootstrap_warns_about_signals_missed_while_offline(make):
     assert "离线期间错过信号 10-02 09:50:59" in text and "!sync" in text and level == "warn" and mention
     assert env.broker.placed == []
     assert env.store.get("last_signal_ts").startswith("2026-10-02T09:50:59")
+
+
+async def test_bootstrap_trades_fresh_signal_missed_during_restart(make):
+    env = make(cash=0.0)
+    example_account(env.broker)
+    env.store.set("last_signal_ts", ny(2026, 10, 2, 9, 40, 0))  # newest signal handled before the restart
+
+    assert await env.engine.bootstrap_from_text(EXAMPLE)  # clock: a few seconds after the signal
+
+    sides = [(r.symbol, r.side) for r in env.broker.placed]
+    assert sides[:2] == [("BE", SELL), ("ARM", SELL)] and ("WDC", BUY) in sides
+    # Handled once: the same text later (live re-delivery) is a duplicate.
+    n = len(env.broker.placed)
+    await env.engine.handle_text(EXAMPLE, env.meta())
+    assert len(env.broker.placed) == n
 
 
 # --------------------------------------------------------------------------- 17 stop sizing

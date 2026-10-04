@@ -459,6 +459,44 @@ def estimate_after_sells(
     )
 
 
+def conservative_account(
+    account: AccountSnapshot,
+    positions: Mapping[str, Position],
+    quotes: Mapping[str, Quote],
+    rates: Mapping[str, MarginRate],
+    cfg: TradingConfig,
+) -> AccountSnapshot:
+    """Guard against stale broker account values.
+
+    IBKR pushes account values only every few minutes, but positions in real time.
+    Rebuild margin usage from live positions × marks × margin rates and keep the
+    more conservative of the reported and the modelled value (lower 剩余流动性 /
+    可用资金, higher gross exposure). NLV is taken as reported.
+    """
+    nlv = account.net_liquidation
+    if not math.isfinite(nlv) or nlv <= 0:
+        return account
+    gpv = maint = init = 0.0
+    for symbol, pos in positions.items():
+        quote = quotes.get(symbol)
+        price = (quote.mark() if quote is not None else None) or _positive(pos.avg_cost)
+        if price is None or not math.isfinite(pos.qty):
+            continue
+        value = abs(pos.qty) * price
+        r = effective_rate(symbol, rates, cfg)
+        gpv += value
+        maint += value * r.maint
+        init += value * r.init
+    return replace(
+        account,
+        excess_liquidity=min(account.excess_liquidity, nlv - maint),
+        available_funds=min(account.available_funds, nlv - init),
+        maint_margin=max(account.maint_margin, maint),
+        init_margin=max(account.init_margin, init),
+        gross_position_value=max(account.gross_position_value, gpv),
+    )
+
+
 def _liquidity_factor(
     buys: Sequence[PlannedOrder],
     account: AccountSnapshot,
