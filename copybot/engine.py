@@ -98,6 +98,7 @@ STOP_MARK_MERGE_SECONDS = 3600  # partial stop fills within 1 h are one stop-out
 RATE_PROBE_MIN_USD = 1000.0  # whatIf probe size: max($1000, 25% NLV)
 RATE_PROBE_NLV_FRACTION = 0.25
 SHUTDOWN_WAIT_SECONDS = 30.0  # stop() waits this long for an in-flight trade
+EXT_SELL_WAIT_SECONDS = 15.0  # pre-market rotation: how long to wait for the sell limits
 
 KV_PAUSED = "paused"
 KV_LAST_SIGNAL_TS = "last_signal_ts"
@@ -105,6 +106,7 @@ KV_PORTFOLIO = "provider_portfolio"
 KV_LAST_MISMATCH = "last_mismatch"
 KV_LAST_DELEVERAGE_TS = "last_deleverage_ts"
 KV_LAST_LIQUIDITY_WARN_TS = "last_liquidity_warn_ts"
+KV_CANCEL_LEFTOVERS = "cancel_leftovers"  # symbols whose extended-hours orders still must be cancelled
 
 SESSION_CN = {Session.PRE: "盘前", Session.REGULAR: "盘中", Session.AFTER: "盘后", Session.CLOSED: "休市"}
 BINDING_CN = {"reserve": "剩余流动性保留", "init_margin": "初始保证金", "leverage_cap": "杠杆上限"}
@@ -301,6 +303,10 @@ class Engine:
         self._sync_preview_at: datetime | None = None
         self._stop_fill_mono: dict[str, float] = {}  # symbol → monotonic time of last stop fill
         self._bg: set[asyncio.Task] = set()  # fire-and-forget tasks (kept referenced)
+        # last_signal_ts as it was before the first history message was read (taken
+        # lazily): None means a first run (empty DB) — history is learned, never traded.
+        self._boot_snapshot_taken = False
+        self._boot_last_signal: datetime | None = None
         self._last_stop_note: tuple[str, float] = ("", 0.0)
         # Tunables (tests shorten them).
         self.cancel_wait_seconds = CANCEL_WAIT_SECONDS
@@ -479,26 +485,70 @@ class Engine:
             return
         async with self._lock:
             try:
-                if not self.broker.is_connected():
-                    return
-                note = await self._cancel_leftovers({symbol})
+                note, filled = await self._cancel_leftovers({symbol})
                 if note:
-                    await self._notify(f"🧹 {symbol} 止损后{note}", level="warn")
+                    await self._notify(f"🧹 {symbol} 止损后：{note}", level="warn", mention=filled)
             except Exception as exc:
                 await self._fail(f"止损后撤销 {symbol} 挂单", exc)
 
-    async def _cancel_leftovers(self, symbols: set[str]) -> str:
-        """Cancel our non-stop working orders for `symbols`; returns a short note ('' if none)."""
+    def _leftover_backlog(self) -> set[str]:
+        raw = self.store.get(KV_CANCEL_LEFTOVERS) or []
+        return {str(x) for x in raw} if isinstance(raw, list) else set()
+
+    def _set_leftover_backlog(self, symbols: set[str]) -> None:
+        self.store.set(KV_CANCEL_LEFTOVERS, sorted(symbols))
+
+    async def _cancel_leftovers(self, symbols: set[str]) -> tuple[str, bool]:
+        """Cancel our extended-hours limit orders for `symbols` (their pending intent is gone).
+
+        Only ``copybot:ext`` orders: protective deleverage sells and stops stay. Symbols
+        whose orders cannot be cancelled now (IBKR down, cancel not confirmed) are kept in
+        a persistent backlog that the stop-sync loop retries. Returns (note, any_filled).
+        """
+        if not symbols:
+            return "", False
+        backlog = self._leftover_backlog() | symbols
+        if not self.broker.is_connected():
+            self._set_leftover_backlog(backlog)
+            return "⚠️ IBKR 未连接，旧的盘前/盘后挂单暂未撤销，连上后自动撤销", False
         working = [
-            o for o in await self.broker.open_orders() if not o.is_stop and not o.is_done and o.symbol in symbols
+            o
+            for o in await self.broker.open_orders()
+            if o.symbol in symbols and o.tag.startswith(EXT_TAG) and not o.is_done
         ]
-        if not working:
-            return ""
-        still = await self._cancel_and_wait(working)
-        note = "已撤销旧挂单：" + "、".join(f"{o.symbol} {_side_cn(o.side)}{o.remaining}股" for o in working)
-        if still:
-            note += "；❌ 未能撤销：" + "、".join(f"{o.symbol}({o.order_id})" for o in still)
-        return note
+        for o in working:
+            try:
+                await self.broker.cancel_order(o.order_id)
+            except Exception as exc:
+                log.warning("cancel leftover %s (%s) failed: %r", o.order_id, o.symbol, exc)
+        finals = await asyncio.gather(*(self._wait_done(o, self.cancel_wait_seconds) for o in working))
+        cancelled, filled, stuck = [], [], []
+        for before, after in zip(working, finals, strict=True):
+            if after.filled_qty > before.filled_qty:
+                filled.append(f"{after.symbol} {_side_cn(after.side)}{after.filled_qty - before.filled_qty}股")
+            if not after.is_done:
+                stuck.append(f"{after.symbol}({after.order_id})")
+            elif after.status != OrderStatus.FILLED:
+                cancelled.append(f"{after.symbol} {_side_cn(after.side)}{after.remaining}股")
+        stuck_symbols = {o.symbol for o, f in zip(working, finals, strict=True) if not f.is_done}
+        self._set_leftover_backlog((backlog - symbols) | stuck_symbols)
+        parts = []
+        if cancelled:
+            parts.append("已撤销旧挂单：" + "、".join(cancelled))
+        if filled:
+            parts.append("⚠️ 撤单前已成交：" + "、".join(filled))
+        if stuck:
+            parts.append("❌ 未能撤销（稍后自动重试）：" + "、".join(stuck))
+        return "；".join(parts), bool(filled)
+
+    async def _retry_leftover_backlog(self) -> None:
+        """Retry cancelling leftovers that could not be cancelled earlier (lock held)."""
+        backlog = self._leftover_backlog()
+        if not backlog or not self.broker.is_connected():
+            return
+        note, filled = await self._cancel_leftovers(backlog)
+        if note:
+            await self._notify(f"🧹 补撤旧挂单（{'、'.join(sorted(backlog))}）：{note}", level="warn", mention=filled)
 
     def _mark_stopped(self, fill: Fill) -> None:
         """Remember the stop-out; partial fills close together add up."""
@@ -588,7 +638,7 @@ class Engine:
 
         # A new signal for a stopped-out symbol ends its stop-out mark — also when it is
         # not traded (paused / stale), so that the advised !sync can follow him back in.
-        reentered = self._clear_stopped(sig)
+        reentered = self._clear_stopped(sig, sig_ts)
 
         # 4. paused
         if self.is_paused:
@@ -641,16 +691,24 @@ class Engine:
         if sem is not None:
             self.store.record_signal(sem, message_id, ts, status, summary)
 
-    def _clear_stopped(self, sig: Signal) -> list[str]:
-        """Clear stop-out marks of the signal's symbols; returns those with an increase."""
+    def _clear_stopped(self, sig: Signal, sig_ts: datetime | None) -> list[str]:
+        """Clear stop-out marks of the signal's symbols; returns those with an increase.
+
+        Only a signal issued after the stop-out counts (an older one, delivered late,
+        does not mean he re-entered).
+        """
         stopped = self.store.stopped()
         reentered: list[str] = []
         for ch in sig.changes:
-            if ch.symbol in stopped and ch.symbol not in self._ignore:
-                self.store.clear_stopped(ch.symbol)
-                stopped.pop(ch.symbol)
-                if ch.is_increase:
-                    reentered.append(ch.symbol)
+            mark = stopped.get(ch.symbol)
+            if mark is None or ch.symbol in self._ignore:
+                continue
+            if sig_ts is not None and sig_ts <= mark["stopped_at"]:
+                continue
+            self.store.clear_stopped(ch.symbol)
+            stopped.pop(ch.symbol)
+            if ch.is_increase:
+                reentered.append(ch.symbol)
         return reentered
 
     async def _drop_superseded(self, sig: Signal) -> str:
@@ -666,12 +724,13 @@ class Engine:
         notes: list[str] = []
         if dropped:
             notes.append(f"已取消被新信号取代的待开盘任务：{'、'.join(dropped)}")
-        if changed and self.broker.is_connected():
+        if changed:
             try:
-                note = await self._cancel_leftovers(changed)
+                note, _ = await self._cancel_leftovers(changed)
             except Exception as exc:
                 log.exception("cancel superseded orders failed")
-                note = f"⚠️ 撤销旧挂单失败：{type(exc).__name__}: {exc}"
+                self._set_leftover_backlog(self._leftover_backlog() | changed)
+                note = f"⚠️ 撤销旧挂单失败（稍后自动重试）：{type(exc).__name__}: {exc}"
             if note:
                 notes.append(note)
         return "".join(f"\n{n}" for n in notes)
@@ -938,6 +997,7 @@ class Engine:
         rep = _Report()
         symbols = {i.symbol for i in intents}
         bad = await self._cancel_working(symbols)
+        self._set_leftover_backlog(self._leftover_backlog() - (symbols - bad))
         for sym in sorted(bad):
             rep.add(f"❌ {sym}：旧挂单未能撤销，本次跳过", "error", mention=True)
         active = [i for i in intents if i.symbol not in bad]
@@ -986,6 +1046,7 @@ class Engine:
         label = SESSION_CN.get(session, "")
         symbols = {i.symbol for i in intents}
         bad = await self._cancel_working(symbols)
+        self._set_leftover_backlog(self._leftover_backlog() - (symbols - bad))
         for sym in sorted(bad):
             rep.add(f"❌ {sym}：旧挂单未能撤销，{label}不下单（开盘再试）", "error", mention=True)
         active = [i for i in intents if i.symbol not in bad]
@@ -1010,15 +1071,19 @@ class Engine:
         account = ctx.account
         if ext_buys and placed:
             # Rotation (sell A, buy B): marketable sell limits usually fill within seconds;
-            # wait for them and credit what filled, like the regular-hours path does.
-            timeout = float(self._t.fill_timeout_seconds)
-            finals = await asyncio.gather(*(self._wait_done(info, timeout) for _, info in placed))
-            placed = [(o, info) for (o, _), info in zip(placed, finals, strict=True)]
-            sold = [
-                (o.symbol, info.filled_qty, info.avg_fill_price or o.ref_price)
-                for o, info in placed
-                if info.filled_qty > 0
-            ]
+            # wait briefly for them and credit what filled, like the regular-hours path.
+            if self._t.dry_run:  # simulated limits never fill: assume they would have
+                sold = [(o.symbol, o.qty, info.limit_price or o.ref_price) for o, info in placed]
+                rep.add("🧪 DRY-RUN：假设盘前/盘后卖单已全部成交，按此计算买入")
+            else:
+                timeout = min(float(self._t.fill_timeout_seconds), EXT_SELL_WAIT_SECONDS)
+                finals = await asyncio.gather(*(self._wait_done(info, timeout) for _, info in placed))
+                placed = [(o, info) for (o, _), info in zip(placed, finals, strict=True)]
+                sold = [
+                    (o.symbol, info.filled_qty, info.avg_fill_price or o.ref_price)
+                    for o, info in placed
+                    if info.filled_qty > 0
+                ]
             account = estimate_after_sells(account, sold, ctx.rates, self._t)
         scaled, s = scale_buys_for_liquidity(ext_buys, account, ctx.rates, self._t)
         self._report_scaling(rep, ext_buys, scaled, s)
@@ -1134,6 +1199,7 @@ class Engine:
     async def _sync_stops(self) -> None:
         if not self.broker.is_connected():
             return
+        await self._retry_leftover_backlog()
         positions = await self.broker.positions()
         open_orders = await self.broker.open_orders()
         working = [o for o in open_orders if not o.is_stop]
@@ -1496,8 +1562,15 @@ class Engine:
     # ------------------------------------------------------------------ bootstrap
 
     async def bootstrap_from_text(self, text: str) -> bool:
-        """Learn the provider portfolio from a history message. Never trades."""
+        """Learn the provider portfolio from a history message.
+
+        Trades only a fresh signal that was posted while the bot was restarting.
+        """
+        if self._closed:
+            return False
         async with self._lock:
+            if self._closed:
+                return False
             try:
                 return await self._bootstrap(text)
             except Exception as exc:
@@ -1514,9 +1587,20 @@ class Engine:
         pf = self._portfolio()
         stored_ts = self._pf_time(pf)
         last = self._kv_time(KV_LAST_SIGNAL_TS)
-        # Newer than everything handled so far (and not the very first run): it was
-        # posted while the bot was offline and will never be traded automatically.
-        missed = ts is not None and last is not None and ts > last and bool(sig.changes)
+        if not self._boot_snapshot_taken:
+            self._boot_snapshot_taken = True
+            self._boot_last_signal = last
+        # Newer than everything handled before this process started (so never on a
+        # first run with an empty DB, even after earlier history moved last_signal_ts)
+        # and newer than everything handled so far: posted while the bot was offline.
+        boot = self._boot_last_signal
+        missed = (
+            ts is not None
+            and boot is not None
+            and ts > boot
+            and (last is None or ts > last)
+            and bool(sig.changes)
+        )
         if missed and ts is not None:
             now = self._now()
             if (now - ts).total_seconds() <= self._t.max_signal_age_seconds:
@@ -1525,9 +1609,13 @@ class Engine:
                 log.info("bootstrap: fresh unprocessed signal %s, handling it live", sig.fingerprint[:8])
                 await self._handle_signal(sig, MessageMeta("history", 0, now))
                 return True
-        newer =pf is None if ts is None else (stored_ts is None or ts > stored_ts)
+        newer = pf is None if ts is None else (stored_ts is None or ts > stored_ts)
+        note = ""
         if missed:
-            self._clear_stopped(sig)  # so the advised !sync can follow him back in
+            # Same clean-up as a live stale signal: his newer instruction supersedes
+            # pending ones (and their leftover orders); a later add re-enables !sync.
+            self._clear_stopped(sig, ts)
+            note = await self._drop_superseded(sig)
         if newer:
             self._update_portfolio(sig, ts)
             if ts is not None and (last is None or ts > last):
@@ -1537,7 +1625,7 @@ class Engine:
         self._record(sig, "", ts, "bootstrap", "")
         if missed and ts is not None:
             await self._notify(
-                f"机器人离线期间错过信号 {_fmt_ts(ts)}：{_signal_summary(sig)}（未自动执行，可用 !sync 对齐）",
+                f"机器人离线期间错过信号 {_fmt_ts(ts)}：{_signal_summary(sig)}（未自动执行，可用 !sync 对齐）{note}",
                 level="warn",
                 mention=True,
             )

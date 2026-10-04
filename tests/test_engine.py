@@ -999,3 +999,126 @@ async def test_stale_add_after_stop_out_clears_mark_so_sync_can_reenter(make):
 
     preview = await env.engine.sync_preview()
     assert "买入 W" in preview
+
+
+# --------------------------------------------------------------------------- review regressions (round 2)
+
+PRE_BUY_X = signal(["建仓 X | 仓位：0.0% → 50.0% | 成交价：100"], ["X | 仓位：50.0% | 成本：100 | 盈亏：0.0%"], "2026-10-02 08:00:00")
+EXIT_X = signal(["清仓 X | 仓位：50.0% → 0.0% | 成交价：无"], [], "2026-10-02 08:12:00")
+
+
+async def test_first_run_never_trades_history_even_with_two_signals(make):
+    env = make(cash=0.0)
+    example_account(env.broker)
+    older = signal(["建仓 BE | 仓位：0.0% → 50.0% | 成交价：200"], None, "2026-09-30 10:00:00")
+    assert await env.engine.bootstrap_from_text(older)
+    assert await env.engine.bootstrap_from_text(EXAMPLE)  # fresh, but this is a first run
+    assert env.broker.placed == []
+    assert not any("离线期间错过信号" in t for t in env.texts())
+
+
+async def test_bootstrap_missed_exit_drops_pending_and_leftover_order(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3))
+    b = env.broker
+    b.set_quote("X", 99.9, 100.1, 100.0)
+    await env.send(PRE_BUY_X)
+    assert len(b.working("X", LMT)) == 1 and env.store.list_pending()
+
+    # Bot restarts; the exit was posted 18 minutes ago while it was offline.
+    env.engine._boot_snapshot_taken = False
+    env.clock.set(ny(2026, 10, 2, 8, 30, 0))
+    assert await env.engine.bootstrap_from_text(EXIT_X)
+    assert b.working("X", LMT) == [] and env.store.list_pending() == []
+    assert "离线期间错过信号" in env.texts()[-1]
+
+    env.clock.set(ny(2026, 10, 2, 9, 30, 6))
+    await env.engine.run_due_pending()
+    assert [r for r in b.placed if r.symbol == "X" and r.order_type == MKT] == []
+
+
+async def test_bootstrap_after_stop_does_not_trade(make):
+    env = make(cash=0.0)
+    example_account(env.broker)
+    env.store.set("last_signal_ts", ny(2026, 10, 2, 9, 40, 0))
+    await env.engine.stop()
+    assert await env.engine.bootstrap_from_text(EXAMPLE) is False
+    assert env.broker.placed == []
+
+
+async def test_leftover_cancel_while_disconnected_is_retried_after_reconnect(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3))
+    b = env.broker
+    b.set_quote("X", 99.9, 100.1, 100.0)
+    await env.send(PRE_BUY_X)
+    await b.set_connected(False, "1100")
+    env.clock.set(ny(2026, 10, 2, 8, 45, 0))  # exit arrives stale while IBKR is down
+    await env.send(EXIT_X)
+    assert "IBKR 未连接" in env.joined()
+    assert env.store.get("cancel_leftovers") == ["X"]
+
+    await b.set_connected(True, "back")
+    await env.engine.sync_stops()  # the stop-sync loop drains the backlog
+    assert b.working("X", LMT) == []
+    assert env.store.get("cancel_leftovers") == []
+
+
+async def test_stale_add_older_than_stop_out_keeps_mark(make):
+    env = make()
+    env.broker.set_quote("W", 49.9, 50.1, 50.0)
+    env.store.mark_stopped("W", ny(2026, 10, 2, 10, 10, 0), 100, 45.0)
+    env.clock.set(ny(2026, 10, 2, 10, 25, 0))
+    await env.send(signal(["加仓 W | 仓位：30.0% → 50.0% | 成交价：46"], None, "2026-10-02 10:00:00"))
+    assert "W" in env.store.stopped()
+
+
+async def test_leftover_filled_during_cancel_is_reported_as_filled(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3))
+    b = env.broker
+    b.set_quote("X", 99.9, 100.1, 100.0)
+    await env.send(PRE_BUY_X)
+    order = b.working("X", LMT)[0]
+    real_cancel = b.cancel_order
+
+    async def cancel_loses_race(order_id: str) -> None:
+        if order_id == order.order_id:
+            await b.fill_order(order_id)  # the fill beats the cancel
+            return
+        await real_cancel(order_id)
+
+    b.cancel_order = cancel_loses_race  # type: ignore[method-assign]
+    env.clock.set(ny(2026, 10, 2, 8, 45, 0))
+    await env.send(EXIT_X)
+    assert "撤单前已成交：X 买入" in env.joined()
+    assert "已撤销旧挂单" not in env.joined()
+
+
+async def test_dry_run_premarket_rotation_does_not_wait_and_buys_half(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3), cash=-90_000.0, cfg=make_cfg(dry_run=True, fill_timeout_seconds=30), wrap=DryRunBroker)
+    b = env.broker
+    b.set_position("BE", 475, 200.0)
+    b.set_quote("BE", 199.9, 200.1, 200.0)
+    b.set_position("ARM", 760, 125.0)
+    b.set_quote("ARM", 124.9, 125.1, 125.0)
+    b.set_quote("WDC", 422.4, 422.8, 422.6)
+    b.rates["WDC"] = MarginRate(0.30, 0.25, "whatif")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await env.send(EXAMPLE.replace("09:50:59", "08:00:00"))
+    assert loop.time() - started < 5  # no 30 s wait for simulated limits
+    assert b.placed == []  # dry-run: nothing real
+    assert "假设盘前/盘后卖单已全部成交" in env.joined()
+    assert "限价买入 WDC" in env.joined()
+
+
+async def test_paused_signal_keeps_protective_deleverage_sell(make):
+    env = make()
+    b = env.broker
+    b.set_position("D", 100, 50.0)
+    b.set_quote("D", 49.9, 50.1, 50.0)
+    b.hold_market = True
+    await b.place_order(OrderRequest("D", SELL, 30, MKT, tag="copybot:dlv"))
+    env.engine.pause()
+    env.clock.set(ny(2026, 10, 2, 9, 51, 30))
+    await env.send(signal(["加仓 D | 仓位：10.0% → 20.0% | 成交价：50"], None, "2026-10-02 09:51:20"))
+    assert [o.tag for o in b.working("D", MKT)] == ["copybot:dlv"]

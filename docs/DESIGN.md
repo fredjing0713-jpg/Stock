@@ -63,7 +63,9 @@ WDC | 仓位：100.0% | 成本：422.6 | 盈亏：+0.1%
 3. **Live liquidity guard (always)**: IBKR pushes account values only every few minutes,
    so the account snapshot is first made conservative (`sizing.conservative_account`):
    margin usage is rebuilt from live positions × marks × margin rates and the stricter of
-   reported vs. modelled EL / AF / GPV is used. Then, before buys, estimate post-sell account
+   reported vs. modelled EL / AF / GPV is used (known, accepted bias: NLV stays as reported,
+   so after a rally since IBKR's last push buys are shrunk by roughly that move — fail-safe).
+   Then, before buys, estimate post-sell account
    (EL' = EL + Σ sold_value·maint_i, AF' = AF + Σ sold_value·init_i, GPV' = GPV − Σ sold_value)
    and scale ALL buys of the batch by one factor
    `s = clamp(min(room_maint/need_maint, room_init/need_init, room_gross/need_gross), 0, 1)`
@@ -81,7 +83,13 @@ WDC | 仓位：100.0% | 成本：422.6 | 盈亏：+0.1%
    * CLOSED (overnight / weekend / holiday): store intents as pending for the next open.
    * Broker disconnected when a signal arrives: store intents as pending (due now in REGULAR,
      next open otherwise); the scheduler runs them once connected.
-   * A newer signal for a symbol replaces that symbol's pending intent.
+   * A newer signal for a symbol replaces that symbol's pending intent. When the newer
+     signal is not traded (paused / stale / missed while offline) the pending intent is
+     dropped and the symbol's leftover `copybot:ext` limit orders are cancelled (also after
+     a stop fill). If IBKR is down or a cancel is not confirmed, the symbol goes into a
+     persistent backlog (`cancel_leftovers`) that every stop-sync tick retries.
+   * Rotation in PRE / AFTER: sells are placed first and waited for (≤ 15 s); their fills are
+     credited before the buy leg is sized (dry-run assumes they fill).
 5. **Guards**: paused → ignore (but still update provider portfolio); duplicate fingerprint
    → ignore silently; signal timestamp older than the newest processed one → ignore + warn;
    age > max_signal_age_seconds → do not trade, warn (portfolio still updated);
@@ -255,8 +263,11 @@ stop-sync loop.
 allowed authors → `engine.handle_text`. Command channel + owner_ids → commands
 `!status !pause !resume !sync [confirm] !cancel !help`. `on_ready` → bootstrap provider
 portfolio from the last 20 messages of the signal channel. A history signal that was never
-processed, is newer than the last handled one and is still fresh (≤ max_signal_age_seconds,
-i.e. posted during a restart) is traded like a live signal; older missed ones only warn.
+processed, is newer than the last signal handled before this process started and is still
+fresh (≤ max_signal_age_seconds, i.e. posted during a restart) is traded like a live signal;
+older missed ones only warn (and supersede pending intents like a stale signal). On a first
+run (empty DB) history is never traded. A stop-out mark is only cleared by a signal issued
+after the stop-out.
 
 ### 3.10 `copybot/app.py` / `copybot/__main__.py`
 Load config, logging (stdout + rotating file), Store, IBKRBroker (wrapped in DryRunBroker
