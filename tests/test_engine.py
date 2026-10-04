@@ -1275,3 +1275,154 @@ async def test_premarket_rotation_trades_only_his_changes_and_rebalances_at_open
     await env.engine.run_due_pending()
     at_open = [(r.symbol, r.side, r.order_type) for r in b.placed[len(pre):]]
     assert ("RKLB", BUY, MKT) in at_open and ("MU", BUY, MKT) in at_open
+
+
+# --------------------------------------------------------------------------- review regressions (round 3)
+
+ROTATE_TO_BE = ["清仓 NVDA | 仓位：33.33% → 0.0% | 成交价：无", "建仓 BE | 仓位：0.0% → 33.33% | 成交价：150"]
+HOLD_BE = [*THREE, "BE | 仓位：33.33% | 成本：150 | 盈亏：0.0%"]
+
+
+def low_margin_three(b: FakeBroker) -> None:
+    """RKLB / MU / NVDA equal thirds at G = 75k / 38.33% (NVDA is the low-margin name)."""
+    b.rates.update({
+        "RKLB": MarginRate(0.45, 0.45), "MU": MarginRate(0.40, 0.40),
+        "BE": MarginRate(0.70, 0.70), "NVDA": MarginRate(0.30, 0.30),
+    })
+    for sym, px in (("RKLB", 50.0), ("MU", 100.0), ("BE", 150.0), ("NVDA", 200.0)):
+        b.set_quote(sym, px - 0.05, px, px)
+    third = 75_000 / ((0.45 + 0.40 + 0.30) / 3) / 3
+    b.set_position("RKLB", int(third / 50), 50.0)
+    b.set_position("MU", int(third / 100), 100.0)
+    b.set_position("NVDA", int(third / 200), 200.0)
+    b.cash = 100_000 - (int(third / 50) * 50 + int(third / 100) * 100 + int(third / 200) * 200)
+
+
+async def test_confirmation_right_after_the_open_joins_the_open_batch(make):
+    env = make(at=ny(2026, 10, 2, 3, 0, 0), cash=0.0, cfg=live_cfg())  # overnight: queued for the open
+    b = env.broker
+    low_margin_three(b)
+    await env.send(signal(ROTATE_TO_BE, HOLD_BE, "2026-10-02 02:59:00"))
+    assert b.placed == []
+
+    env.clock.set(ny(2026, 10, 2, 9, 30, 1))  # his fill broadcast lands before our 09:30:05 batch
+    await env.send(signal(ROTATE_TO_BE, HOLD_BE, "2026-10-02 09:30:00"))
+    assert b.placed == [] and "并入" in env.texts()[-1]
+
+    env.clock.set(ny(2026, 10, 2, 9, 30, 6))
+    await env.engine.run_due_pending()
+    values = [b.qty("RKLB") * 50, b.qty("MU") * 100, b.qty("BE") * 150]
+    assert b.qty("NVDA") == 0 and max(values) - min(values) <= 200  # equal thirds, BE not under-bought
+
+
+async def test_no_rebalance_without_holdings_section(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    b = env.broker
+    three_stock_account(b)
+    await env.send(signal(["加仓 MU | 仓位：33.33% → 40.0% | 成交价：100"], None, "2026-10-02 09:50:59"))
+    assert {r.symbol for r in b.placed} == {"MU"}
+
+
+async def test_pure_exit_does_not_top_up_the_others(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    b = env.broker
+    three_stock_account(b)
+    await env.send(signal(["清仓 BE | 仓位：33.33% → 0.0% | 成交价：无"], THREE, "2026-10-02 09:50:59"))
+    assert [(r.symbol, r.side) for r in b.placed] == [("BE", SELL)]
+
+
+async def test_rebalance_never_reopens_a_stopped_out_symbol(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    b = env.broker
+    three_stock_account(b)
+    await env.engine.sync_stops()
+    await b.trigger_stop("RKLB")
+    env.clock.advance(minutes=1)
+    await env.send(signal(["减仓 RKLB | 仓位：33.33% → 20.0% | 成交价：无"],
+                          ["RKLB | 仓位：20.0% | 成本：50 | 盈亏：0.0%", *THREE[1:], "BE | 仓位：33.33% | 成本：150 | 盈亏：0.0%"],
+                          "2026-10-02 09:52:00"))
+    env.clock.advance(minutes=1)
+    await env.send(signal(
+        ["清仓 BE | 仓位：33.33% → 0.0% | 成交价：无", "建仓 NVDA | 仓位：0.0% → 33.33% | 成交价：200"],
+        ["RKLB | 仓位：20.0% | 成本：50 | 盈亏：0.0%", THREE[1], "NVDA | 仓位：33.33% | 成本：200 | 盈亏：0.0%"],
+        "2026-10-02 09:53:00",
+    ))
+    assert b.qty("RKLB") == 0
+    assert not any(r.symbol == "RKLB" and r.side == BUY for r in b.placed)
+
+
+async def test_rebalance_does_not_buy_a_chase_skipped_symbol(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    b = env.broker
+    three_stock_account(b)
+    b.set_quote("NVDA", 224.9, 225.0, 225.0)  # 12.5% above his 200 → 不追
+    await env.send(ROTATE)
+    assert b.qty("NVDA") == 0
+    env.clock.advance(minutes=5)
+    await env.send(signal(["加仓 MU | 仓位：33.33% → 34.0% | 成交价：100"],
+                          [THREE[0], "MU | 仓位：34.0% | 成本：100 | 盈亏：0.0%", "NVDA | 仓位：33.33% | 成本：200 | 盈亏：0.0%"],
+                          "2026-10-02 09:56:00"))
+    assert b.qty("NVDA") == 0
+
+
+async def test_rebalance_keeps_a_pending_signal_and_its_premarket_order(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3), cash=0.0, cfg=live_cfg())
+    b = env.broker
+    three_stock_account(b)
+    await env.send(ROTATE.replace("09:50:59", "08:00:00"))
+    nvda = b.working("NVDA", LMT)
+    assert len(nvda) == 1
+    env.clock.set(ny(2026, 10, 2, 8, 30, 0))
+    await env.send(signal(["加仓 MU | 仓位：33.33% → 34.0% | 成交价：100"],
+                          [THREE[0], "MU | 仓位：34.0% | 成本：100 | 盈亏：0.0%", "NVDA | 仓位：33.33% | 成本：200 | 盈亏：0.0%"],
+                          "2026-10-02 08:30:00"))
+    assert [o.order_id for o in b.working("NVDA", LMT)] == [nvda[0].order_id]
+    pending = {it.symbol: it for it, _ in env.store.list_pending()}
+    assert pending["NVDA"].kind == "signal" and pending["NVDA"].signal_price == 200.0
+
+
+async def test_premarket_confirmation_keeps_working_orders(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3), cash=0.0, cfg=live_cfg())
+    b = env.broker
+    three_stock_account(b)
+    await env.send(ROTATE.replace("09:50:59", "08:00:00"))
+    working = sorted(o.order_id for o in b.working(order_type=LMT))
+    n = len(b.placed)
+    env.clock.set(ny(2026, 10, 2, 8, 5, 0))
+    await env.send(ROTATE.replace("09:50:59", "08:05:00"))  # re-broadcast
+    assert sorted(o.order_id for o in b.working(order_type=LMT)) == working
+    assert len(b.placed) == n
+
+
+async def test_rebroadcast_of_a_paused_signal_is_traded_in_full(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    b = env.broker
+    low_margin_three(b)
+    env.engine.pause()
+    await env.send(signal(ROTATE_TO_BE, HOLD_BE, "2026-10-02 09:50:59"))
+    env.engine.resume()
+    env.clock.advance(minutes=2)
+    await env.send(signal(ROTATE_TO_BE, HOLD_BE, "2026-10-02 09:52:30"))  # his fill broadcast
+    assert "重复播报" not in env.texts()[-1]
+    values = [b.qty("RKLB") * 50, b.qty("MU") * 100, b.qty("BE") * 150]
+    assert b.qty("NVDA") == 0 and max(values) - min(values) <= 200
+
+
+async def test_sync_preview_outside_regular_hours_says_it_runs_at_the_open(make):
+    env = make(at=ny(2026, 10, 2, 8, 0, 3), cash=0.0, cfg=live_cfg())
+    three_stock_account(env.broker)
+    await env.send(ROTATE.replace("09:50:59", "08:00:00"))
+    preview = await env.engine.sync_preview()
+    assert "不在盘前/盘后下单" in preview and "先挂限价单" not in preview
+
+
+async def test_missed_exit_is_forgotten_so_a_later_reentry_is_a_signal(make):
+    env = make(cash=0.0, cfg=live_cfg())
+    b = env.broker
+    three_stock_account(b)
+    await env.send(ROTATE)  # remembers NVDA 0→33.33
+    env.engine._boot_snapshot_taken = False
+    env.clock.set(ny(2026, 10, 2, 11, 0, 0))
+    exit_nvda = signal(["清仓 NVDA | 仓位：33.33% → 0.0% | 成交价：无"], THREE, "2026-10-02 10:00:00")
+    await env.engine.bootstrap_from_text(exit_nvda)  # missed while offline
+    assert "NVDA" not in (env.store.get("last_changes") or {})

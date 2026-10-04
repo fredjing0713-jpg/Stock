@@ -64,19 +64,27 @@ WDC | 仓位：100.0% | 成本：422.6 | 盈亏：+0.1%
      live positions at signal time, and does the right thing when a pre-market entry was
      only half filled.
    * Direction clamp: a buy intent never sells, a sell intent never buys, never go short.
-2b. **Proportional following (二次调仓)**: after a signal with at least one real change, his
-   other holdings (provider weight > 0, not stopped-out / ignored) get
+2b. **Proportional following (二次调仓)**: after a signal that carries 持仓明细 and has at least
+   one real increase (a rotation / add into something), his other holdings (provider weight
+   > 0, not stopped-out / ignored, no pending signal/confirm/sync intent) get
    `Intent(direction="both", kind="rebalance", band=rebalance_band_pct)` so that all his
    positions are re-sized to the NEW G (a rotation into a lower-margin stock raises G → top up
-   the others; higher margin → trim them). Symbols we hold but he does not are never sold by
-   this (a partial holdings list must not liquidate anything). Outside regular hours only
-   `kind="signal"` intents trade; rebalance / confirm / sync intents wait for the open.
+   the others; higher margin → trim them). A rebalance intent never opens a position (we hold
+   0 → nothing), so chase-skipped and stopped-out symbols are not bought by it, and symbols we
+   hold but he does not are never sold by it. Pure exits (no increase) do not rebalance.
+   Outside regular hours only `kind="signal"` / `"confirm"` intents trade (and only their
+   symbols' working orders are cancelled); rebalance / sync intents wait for the open.
+   A REGULAR-hours signal arriving while today's open batch has not run yet joins that batch
+   (so its exits / trims are credited before the buys).
 2c. **Confirmations**: he broadcasts a change when he places the order and again when it fills.
-   A change line identical (symbol, from, to) to his latest change for that symbol becomes
-   `kind="confirm"` with the rebalance band: it fills a meaningful gap only, never counts as a
-   new add after a stop-out (buy confirmations for stopped-out symbols are dropped), and does
-   not trigger 二次调仓. His 成本 (cost) is never used (his app lowers it after partial
-   profit-taking); stops use our own IBKR average cost.
+   A change line identical (symbol, from, to) to his latest *dispatched* change for that
+   symbol becomes `kind="confirm"` with the rebalance band: it fills a meaningful gap only,
+   never counts as a new add after a stop-out (buy confirmations for stopped-out symbols are
+   dropped), and does not trigger 二次调仓. Outside regular hours a confirmation of a symbol
+   whose original intent is still pending is ignored (its orders keep working). Changes of
+   untraded signals (paused / stale / missed while offline) are forgotten, so his next
+   broadcast of them counts as a new signal. His 成本 (cost) is never used (his app lowers it
+   after partial profit-taking); stops use our own IBKR average cost.
 2d. All share quantities are whole shares rounded down.
 3. **Live liquidity guard (always)**: IBKR pushes account values only every few minutes,
    so the account snapshot is first made conservative (`sizing.conservative_account`):

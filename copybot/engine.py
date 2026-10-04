@@ -651,17 +651,18 @@ class Engine:
         # same change (same symbol, same from→to) again is a confirmation — it fills a
         # meaningful gap only and never counts as a new add after a stop-out.
         confirms = self._confirmations(sig)
-        self._remember_changes(sig)
         reentered = self._clear_stopped(sig, sig_ts, skip=confirms)
 
         # 4. paused
         if self.is_paused:
+            self._forget_changes(sig)  # not traded: his next broadcast is not a "confirmation"
             self._record(sig, meta.message_id, sig_ts, "paused", summary)
             await self._notify(f"⏸️ 已暂停，未执行: {summary}{await self._drop_superseded(sig)}")
             return
 
         # 5. stale
         if age > self._t.max_signal_age_seconds:
+            self._forget_changes(sig)
             self._record(sig, meta.message_id, sig_ts, "stale", summary)
             await self._notify(
                 f"信号已过期 {age:.0f} 秒，未交易（可用 !sync 对齐）：{summary}{await self._drop_superseded(sig)}",
@@ -671,7 +672,8 @@ class Engine:
             return
 
         # 6. intents (a stopped-out symbol with an add / open signal is bought back)
-        intents = self._signal_intents(sig, confirms)
+        intents = self._signal_intents(sig, confirms, now)
+        self._remember_changes(sig)
         for sym in reentered:
             rep.add(f"🔁 {sym} 止损后重新跟入")
         if confirms:
@@ -727,6 +729,14 @@ class Engine:
             if last.get(ch.symbol) == [round(ch.from_weight, 6), round(ch.to_weight, 6)]
         }
 
+    def _forget_changes(self, sig: Signal) -> None:
+        """An untraded signal: its symbols' next broadcast must count as new, not a confirmation."""
+        last = self.store.get(KV_LAST_CHANGES) or {}
+        if isinstance(last, dict) and any(ch.symbol in last for ch in sig.changes):
+            for ch in sig.changes:
+                last.pop(ch.symbol, None)
+            self.store.set(KV_LAST_CHANGES, last)
+
     def _remember_changes(self, sig: Signal) -> None:
         if not sig.changes:
             return
@@ -737,17 +747,30 @@ class Engine:
             last[ch.symbol] = [round(ch.from_weight, 6), round(ch.to_weight, 6)]
         self.store.set(KV_LAST_CHANGES, last)
 
-    def _signal_intents(self, sig: Signal, confirms: set[str]) -> list[Intent]:
+    def _signal_intents(self, sig: Signal, confirms: set[str], now: datetime) -> list[Intent]:
         """His change lines, plus (after a real 调仓) his other holdings re-sized to the new G."""
         band = self._rebalance_band
         stopped = set(self.store.stopped())  # marks still set: no new add from him since
-        intents = [
-            replace(i, kind="confirm", band=band) if i.symbol in confirms else i
-            for i in intents_from_signal(sig, self._ignore)
-            if not (i.symbol in stopped and i.direction == "buy")
-        ]
-        if self._t.rebalance_on_signal and any(i.kind == "signal" for i in intents):
-            exclude = {i.symbol for i in intents} | stopped | self._ignore
+        pending = {it.symbol: it for it, _ in self.store.list_pending()}
+        regular = session_at(now) == Session.REGULAR
+        intents: list[Intent] = []
+        for i in intents_from_signal(sig, self._ignore):
+            if i.symbol in stopped and i.direction == "buy":
+                continue
+            if i.symbol in confirms:
+                if not regular and i.symbol in pending:
+                    continue  # the original is still queued for the open, with its orders working
+                i = replace(i, kind="confirm", band=band)
+            intents.append(i)
+        # 二次调仓 only after a real rotation / add into something, and only with his fresh
+        # 持仓明细 weights (a message without them would re-size on stale weights).
+        if (
+            self._t.rebalance_on_signal
+            and sig.has_holdings_section
+            and any(i.kind == "signal" and i.direction == "buy" for i in intents)
+        ):
+            queued = {s for s, it in pending.items() if it.kind != "rebalance"}
+            exclude = {i.symbol for i in intents} | stopped | self._ignore | queued
             intents += rebalance_intents(self._provider_weights(), exclude, band, sig.fingerprint)
         return intents
 
@@ -823,6 +846,14 @@ class Engine:
             rep.add(f"⏳ IBKR 未连接，已排队，最早 {_fmt_ts(due, True)} 连上后执行", "warn")
             return rep, "queued"
         if session == Session.REGULAR:
+            batch = self._open_batch_due(now)
+            if batch is not None:
+                # Today's open batch has not run yet: join it, so that its sells (exits,
+                # trims) are credited before these buys are sized.
+                self._queue(intents, batch)
+                rep = _Report()
+                rep.add(f"⏳ 并入 {_fmt_ts(batch, True)} 的开盘批量执行")
+                return rep, "queued"
             return await self._execute_regular(intents, key8), "done"
         if session.is_extended:
             return await self._execute_extended(intents, key8, session), "extended"
@@ -831,6 +862,15 @@ class Engine:
         rep = _Report()
         rep.add(f"🌙 休市中，已安排在 {_fmt_ts(due, True)} 开盘执行")
         return rep, "queued"
+
+    def _open_batch_due(self, now: datetime) -> datetime | None:
+        """Due time of today's not-yet-executed pending batch, or None."""
+        hours = regular_hours(now.date())
+        if hours is None:
+            return None
+        cutoff = hours[0] - timedelta(seconds=PENDING_GRACE_SECONDS)
+        due = [at for _, at in self.store.list_pending() if at >= cutoff]
+        return min(due) if due else None
 
     def _queue(self, intents: Iterable[Intent], due: datetime) -> None:
         for it in intents:
@@ -898,6 +938,10 @@ class Engine:
 
     def _resolve(self, intents: Sequence[Intent], ctx: _Context) -> tuple[list[PlannedOrder], list[SkipNote]]:
         """resolve_intents (each intent carries its own tolerance band). SELLs first."""
+        intents = [
+            replace(i, kind="sync", band=SYNC_BAND) if i.signal_key == SYNC_KEY and i.kind == "signal" else i
+            for i in intents
+        ]
         orders, skips = resolve_intents(intents, ctx.positions, ctx.quotes, ctx.gross.gross, self._t)
         sells = [o for o in orders if o.side == Side.SELL]
         buys = [o for o in orders if o.side == Side.BUY]
@@ -1102,8 +1146,11 @@ class Engine:
         due = self._open_due(now)
         label = SESSION_CN.get(session, "")
         symbols = {i.symbol for i in intents}
-        bad = await self._cancel_working(symbols)
-        self._set_leftover_backlog(self._leftover_backlog() - (symbols - bad))
+        # Only his change lines (and their confirmations) trade now; 二次调仓 / !sync wait
+        # for the open and must not cancel orders a signal placed earlier.
+        trade_now = {i.symbol for i in intents if i.kind in ("signal", "confirm")}
+        bad = await self._cancel_working(trade_now)
+        self._set_leftover_backlog(self._leftover_backlog() - (trade_now - bad))
         for sym in sorted(bad):
             rep.add(f"❌ {sym}：旧挂单未能撤销，{label}不下单（开盘再试）", "error", mention=True)
         active = [i for i in intents if i.symbol not in bad]
@@ -1111,9 +1158,7 @@ class Engine:
         rep.lines.extend(self._context_lines(ctx))
         orders, skips = self._resolve(active, ctx)
         by_symbol = {i.symbol: i for i in active}
-        # Only his actual change lines trade outside regular hours; confirmations,
-        # 二次调仓 and !sync wait for the open (thin pre-market books, no urgency).
-        now_orders = [o for o in orders if by_symbol[o.symbol].kind == "signal"]
+        now_orders = [o for o in orders if o.symbol in trade_now]
         ext = split_extended(now_orders, self._t.extended_hours_buy_fraction, self._t.extended_hours_sell_fraction)
         tag = f"{EXT_TAG}:{key8}"
         buffer = self._t.ext_limit_buffer_pct
@@ -1456,7 +1501,7 @@ class Engine:
             lines.append(f"⏭️ {sk.symbol}：{sk.reason}")
         session = session_at(now)
         if session.is_extended:
-            lines.append(f"当前{SESSION_CN[session]}：确认后先挂限价单（买入先下一部分），其余开盘市价执行")
+            lines.append(f"当前{SESSION_CN[session]}：!sync 不在盘前/盘后下单，确认后在 {_fmt_ts(self._open_due(now), True)} 开盘市价执行")
         elif session == Session.CLOSED:
             lines.append("当前休市：确认后在下一个开盘执行")
         if any(o.side == Side.BUY for o in orders):
@@ -1675,7 +1720,8 @@ class Engine:
         if missed:
             # Same clean-up as a live stale signal: his newer instruction supersedes
             # pending ones (and their leftover orders); a later add re-enables !sync.
-            self._clear_stopped(sig, ts)
+            self._clear_stopped(sig, ts, skip=self._confirmations(sig))
+            self._forget_changes(sig)  # untraded: his next broadcast of it is not a confirmation
             note = await self._drop_superseded(sig)
         if newer:
             self._update_portfolio(sig, ts)

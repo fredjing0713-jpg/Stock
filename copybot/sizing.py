@@ -415,6 +415,10 @@ def _resolve_one(
         return SkipNote(sym, SKIP_BAD_DIRECTION)
     if intent.direction == "sell" and cur == 0:
         return None  # nothing to sell, and a sell intent never buys
+    if intent.kind == "rebalance" and cur == 0:
+        # 二次调仓 only re-sizes positions we hold; opening one (a chase-skipped or
+        # stopped-out symbol) is left to his own 建仓/加仓 signal or !sync.
+        return None
     weight = intent.target_weight
     if not math.isfinite(weight):
         return SkipNote(sym, SKIP_BAD_WEIGHT)
