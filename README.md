@@ -272,8 +272,8 @@ discord:
    等待登录期间机器人无法交易：信号会存为待执行，连上后执行，并在 Discord 报警。
 7. **保证金账户类型**：
    - **Reg T**（普通保证金账户）：隔夜最多约 2 倍杠杆，保持 `trading.regt_overnight_check: true`（默认）。
-   - **Portfolio Margin**（需要较高净资产，门槛以 IBKR 官网为准）：保证金率更低，可以适当调高
-     `max_gross_leverage`；`reserve_ratio` 仍然会限制总仓位。
+   - **Portfolio Margin**（需要较高净资产，门槛以 IBKR 官网为准）：保证金率更低，把
+     `trading.regt_overnight_check` 改成 `false`，总仓位就完全由 25% 剩余流动性（`reserve_ratio`）决定。
    - 净资产较低的保证金账户可能受日内交易（PDT）规则限制，以 IBKR / FINRA 最新规定为准。
 
 ---
@@ -288,7 +288,7 @@ discord:
 curl -fsSL https://get.docker.com | sudo sh
 
 # 2. 上传代码 (git clone 或 scp 整个目录)
-git clone <你的仓库地址> copybot && cd copybot
+git clone -b claude/discord-copy-trading-system-m8ceb5 https://github.com/fredjing0713-jpg/Stock.git copybot && cd copybot
 
 # 3. 配置
 cp .env.example .env && chmod 600 .env && nano .env              # token、IBKR 账号密码
