@@ -1,0 +1,30 @@
+# Secrets and runtime state never go into the image.
+.env
+.env.*
+!.env.example
+config.yaml
+data/
+logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Dev / VCS clutter
+.git/
+.gitignore
+.venv/
+venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+tests/
+docs/
+docker-compose*.yml
+Dockerfile
+.dockerignore

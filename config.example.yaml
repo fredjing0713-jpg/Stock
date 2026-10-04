@@ -1,0 +1,117 @@
+# =====================================================================
+# copybot 配置 —— 复制为 config.yaml 后修改: cp config.example.yaml config.yaml
+# 字段与 copybot/config.py 一一对应; 写错字段名会启动失败 (防止拼错后静默用默认值)。
+# 不写的字段使用程序默认值 (下面写出的就是默认值, 另有说明的除外)。
+# 密钥 (Discord token、IBKR 密码) 不放这里, 放 .env。
+# 所有比例都是小数 (0.25 = 25%), 名字以 _pct 结尾的是百分数 (10.0 = 10%)。
+# =====================================================================
+
+discord:
+  # 你转发信号进来的频道 ID (开发者模式下右键频道 → 复制频道 ID)。必填。
+  signal_channel_id: 111111111111111111
+  # 只把这些用户 / webhook 发的消息当作信号。强烈建议填写:
+  #   - 你自己的用户 ID (你用自己的账号转发 / 粘贴时)
+  #   - 「关注」公告频道产生的 webhook ID (右键那条消息的发送者 → 复制用户 ID)
+  # 留空 [] = 能在该频道发言的任何人都能触发交易 (启动时会警告)。
+  allowed_signal_author_ids: [222222222222222222]
+  # 机器人播报下单 / 成交 / 报警的频道 ID。必填。
+  log_channel_id: 333333333333333333
+  # 接收 ! 命令的频道 ID。null = 与 log_channel_id 相同。
+  control_channel_id: null
+  # 可以执行 ! 命令的人 (用户 ID); 重要报警时会 @ 他们。
+  owner_ids: [222222222222222222]
+
+ibkr:
+  # 用 docker compose 部署时, host / port 会被环境变量 IBKR_HOST / IBKR_PORT 覆盖
+  # (host = ib-gateway, port 取 .env 的 IBKR_PORT), 这里的值只在本机直接运行时生效。
+  host: 127.0.0.1
+  # gnzsnz/ib-gateway 容器: 4004 = paper, 4003 = live。
+  # 本机桌面版 IB Gateway: 4002 = paper, 4001 = live; TWS: 7497 = paper, 7496 = live。
+  port: 4004
+  # API 客户端编号, 同一个 Gateway 上不要和别的程序重复。
+  client_id: 17
+  # 账户号 (如 U1234567 / 模拟盘 DU1234567)。留空 = 登录用户的第一个账户。
+  # 一个用户名下有多个账户时务必填写, 防止下到别的账户。
+  account: ""
+  # 行情类型: 1 = 实时 (需要行情订阅), 3 = 延时 (没有订阅时才用; 盘前价格会不准)。
+  market_data_type: 1
+  connect_timeout_seconds: 15.0
+
+trading:
+  # true = 只算不下单 (读取真实账户和行情, 下单只是模拟并播报)。
+  # 上线顺序: paper + true → paper + false → live + true → live + false。见 README「上线步骤」。
+  dry_run: true
+
+  # ---- 融资 / 仓位基数 G (他的「100% 仓位」对应多少美元) ----
+  # 目标剩余流动性 = 净资产 × 25%。G 按「满仓后仍保留这么多剩余流动性」计算。
+  reserve_ratio: 0.25
+  # 总持仓市值 / 净资产 上限。Reg T 账户隔夜上限约 2.0, 建议 ≤ 1.9;
+  # Portfolio Margin 账户可以更高 (但风险也更大)。
+  max_gross_leverage: 1.9
+  # 开仓时可用资金 (AvailableFunds) 至少保留 净资产 × 2%。
+  init_margin_buffer: 0.02
+  # 拿不到 IBKR 实际保证金率 (whatIf) 时使用的默认初始 / 维持保证金比例。
+  default_init_margin: 0.50
+  default_maint_margin: 0.30
+  # whatIf 得到的保证金率低于此值视为异常, 按此值计算 (宁可保守)。
+  min_margin_rate: 0.10
+  # 手动指定某些股票的保证金率 (优先级最高), 例如:
+  #   margin_overrides:
+  #     WDC: {init: 0.40, maint: 0.30}
+  #     ARM: {init: 0.50, maint: 0.40}
+  margin_overrides: {}
+  # IBKR whatIf 保证金率的缓存时间 (秒)。
+  margin_cache_seconds: 1800
+
+  # ---- 盘前 / 盘后 (美东 04:00-09:30 / 16:00-20:00) ----
+  # 盘前 / 盘后买入: 先下目标增量的 50% 限价单, 其余在开盘后市价补齐。
+  extended_hours_buy_fraction: 0.5
+  # 盘前 / 盘后卖出: 1.0 = 全部先下限价单, 开盘时未成交部分撤单改市价。
+  extended_hours_sell_fraction: 1.0
+  # 盘前限价: 买 = 卖一价 × (1 + 0.5%), 卖 = 买一价 × (1 - 0.5%)。
+  ext_limit_buffer_pct: 0.5
+  # 开盘后等几秒再执行开盘任务 (避开开盘第一笔撮合的混乱)。
+  open_delay_seconds: 5
+
+  # ---- 下单保护 ----
+  # 追高保护: 买入参考价比他的成交价高出超过 10% → 不买, 只报警。
+  max_price_deviation_pct: 10.0
+  # 信号时间戳比收到时早超过 600 秒 (10 分钟) → 不交易, 只报警 (他的持仓记录仍会更新)。
+  max_signal_age_seconds: 600
+  # 小于此金额 (美元) 的买单 / 非清仓卖单直接忽略 (清仓卖单不受限)。
+  min_order_value_usd: 100.0
+  # 市价单等待成交的最长时间 (秒)。
+  fill_timeout_seconds: 60
+
+  # ---- 止损 ----
+  # 按持仓均价下方 X% 挂 GTC 止损单 (在 IBKR 服务器端, 机器人离线也有效; 只在常规时段触发)。
+  # 程序默认值是 10.0; 这里按你的要求设为 7%。
+  stop_loss_pct: 7.0
+  # 每隔多少秒核对一次止损单 (成交后也会立即核对)。
+  stop_sync_interval_seconds: 30
+
+  # ---- 其他 ----
+  # 机器人永远不碰的股票 (不跟单、不挂止损、不降杠杆、!sync 也不动)。
+  # 账户里有你自己手动管理的持仓时, 一定要把它们写在这里!
+  ignore_symbols: []
+  # 他的股票代码 → IBKR 代码 (一般不需要; BRK.B 这种带点的会自动转成 "BRK B")。
+  #   symbol_aliases:
+  #     XYZ: "XYZ1"
+  symbol_aliases: {}
+
+risk:
+  # 动态降杠杆: 剩余流动性 / 净资产 跌破 15% 时, 所有持仓按同一比例卖出,
+  # 使剩余流动性回到 reserve_ratio (25%)。只在常规时段运行; 暂停跟单时也运行。
+  deleverage_enabled: true
+  # 必须小于 trading.reserve_ratio。
+  deleverage_trigger_ratio: 0.15
+  # 两次降杠杆之间至少间隔多少秒。
+  deleverage_cooldown_seconds: 900
+  # 每隔多少秒检查一次剩余流动性。
+  liquidity_check_interval_seconds: 60
+
+storage:
+  # 相对于工作目录 (Docker 中为 /app, 已挂载为宿主机的 ./data 和 ./logs)。
+  # 用 Docker 部署时不要改。
+  db_path: data/copybot.db
+  log_dir: logs

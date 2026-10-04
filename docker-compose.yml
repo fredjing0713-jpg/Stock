@@ -1,0 +1,74 @@
+# copybot + IB Gateway. 用法见 README.md「部署」:
+#   cp .env.example .env && cp config.example.yaml config.yaml   # 然后编辑这两个文件
+#   mkdir -p data logs && sudo chown -R 1000:1000 data logs
+#   docker compose up -d --build
+#
+# 变量 ${...} 来自同目录的 .env (docker compose 自动读取)。
+# 安全: IB API 端口 (4003/4004) 只在 compose 内部网络可见, 不映射到宿主机;
+#       VNC 只绑定 127.0.0.1, 需要时用 ssh -L 隧道访问。
+name: copybot
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  ib-gateway:
+    # https://github.com/gnzsnz/ib-gateway-docker  (变量含义以官方 README 为准)
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: always
+    environment:
+      TWS_USERID: ${TWS_USERID:?请在 .env 中填写 TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD:?请在 .env 中填写 TWS_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      # 必须为 no, 否则 API 只读, 机器人无法下单
+      READ_ONLY_API: ${READ_ONLY_API:-no}
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+      TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION:-restart}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}
+      TWOFA_EXIT_INTERVAL: ${TWOFA_EXIT_INTERVAL:-60}
+      TWOFA_DEVICE: ${TWOFA_DEVICE:-}
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:59 PM}
+      TWS_COLD_RESTART: ${TWS_COLD_RESTART:-}
+      EXISTING_SESSION_DETECTED_ACTION: ${EXISTING_SESSION_DETECTED_ACTION:-primary}
+      TWS_ACCEPT_INCOMING: ${TWS_ACCEPT_INCOMING:-accept}
+      BYPASS_WARNING: ${BYPASS_WARNING:-}
+      ALLOW_BLIND_TRADING: ${ALLOW_BLIND_TRADING:-no}
+      JAVA_HEAP_SIZE: ${JAVA_HEAP_SIZE:-}
+      TIME_ZONE: ${TIME_ZONE:-America/New_York}
+      TZ: ${TIME_ZONE:-America/New_York}
+    ports:
+      # 只给本机 (经 SSH 隧道) 用 VNC 查看 Gateway 界面; 未设置 VNC_SERVER_PASSWORD 时 VNC 不启动
+      - "127.0.0.1:5900:5900"
+    logging: *default-logging
+
+  copybot:
+    build: .
+    image: copybot:local
+    restart: unless-stopped
+    depends_on:
+      - ib-gateway
+    init: true # tini as PID 1: forwards SIGTERM, reaps zombies
+    stop_grace_period: 30s
+    # Only what the bot needs (the IBKR password stays in the gateway container).
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?请在 .env 中填写 DISCORD_TOKEN}
+      IBKR_HOST: ib-gateway
+      # paper → 4004, live → 4003 (gnzsnz/ib-gateway 容器内 socat 端口), 必须与 TRADING_MODE 对应
+      IBKR_PORT: ${IBKR_PORT:-4004}
+      # 空 = 以 config.yaml 的 trading.dry_run 为准; true/false 可临时覆盖
+      COPYBOT_DRY_RUN: ${COPYBOT_DRY_RUN:-}
+      COPYBOT_CONFIG: /app/config.yaml
+      TZ: America/New_York
+    volumes:
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false # 缺少 config.yaml 时直接报错, 而不是建一个同名空目录
+      - ./data:/app/data
+      - ./logs:/app/logs
+    logging: *default-logging
